@@ -1382,6 +1382,10 @@ final class CompanionManager: ObservableObject {
       use for a SINGLE visible element. examples: "where's the save button", "point at the color inspector", "what is this tab".
       label = literal visible text on screen.
 
+    UI ELEMENT HINTS (set-of-marks):
+    alongside screenshots you will sometimes receive a "UI elements on screen" message listing pointable elements as [role:label] tokens — for example [button:Save] [menu:File] [item:New File...] [tab:Preview] [field:Search].
+    these labels come straight from the accessibility tree, so they are guaranteed to resolve. when a listed element matches what the user asked for, pass that EXACT label string (the part after the colon) to point_at_element or to a workflow step. if nothing matches, fall back to the visible text you see in the screenshot.
+
     TOOL: submit_workflow_plan(goal, app, steps)
       use for ANYTHING that requires more than one click, including:
         - opening a menu then picking an item ("how do I save" → File → Save)

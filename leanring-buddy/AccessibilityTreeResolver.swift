@@ -65,6 +65,142 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
 
     // MARK: - Entry Point
 
+    /// A compact set-of-marks token from a set-of-marks walk — one
+    /// pointable element the model can reference by literal label.
+    struct ElementMark {
+        let role: String          // Short role word ("button", "menu", "tab"…)
+        let label: String         // Exact visible text
+        let center: CGPoint       // Global AppKit center — used for sort order only
+    }
+
+    /// Walk the target app's AX tree and return a compact list of
+    /// pointable elements for set-of-marks prompting. Gemini gets these
+    /// labels alongside each screenshot so it can reference them
+    /// verbatim in `point_at_element`/`submit_workflow_plan` calls
+    /// rather than guessing pixel coordinates. This is the biggest
+    /// single accuracy lever for apps with good AX support.
+    ///
+    /// Returns nil when the target app has no AX tree (caller should
+    /// skip sending marks for those apps and let Gemini rely on vision
+    /// + YOLO fallback).
+    func setOfMarksForTargetApp(hint: String?, maxElements: Int = 80) -> [ElementMark]? {
+        guard Self.isPermissionGranted else { return nil }
+        let (targetApp, _) = resolveTargetApp(hint: hint)
+        guard let targetApp else { return nil }
+
+        AXUIElementSetMessagingTimeout(targetApp, 0.2)
+
+        var collected: [ElementMark] = []
+        let deadline = Date().addingTimeInterval(0.25)
+        let pointableOnly = Self.pointableRoles
+
+        func shortRole(_ role: String) -> String {
+            switch role {
+            case "AXButton", "AXMenuButton": return "button"
+            case "AXMenuBarItem", "AXMenu": return "menu"
+            case "AXMenuItem": return "item"
+            case "AXTab": return "tab"
+            case "AXCheckBox": return "checkbox"
+            case "AXRadioButton": return "radio"
+            case "AXTextField", "AXTextArea", "AXComboBox": return "field"
+            case "AXLink": return "link"
+            case "AXPopUpButton": return "popup"
+            case "AXSlider": return "slider"
+            case "AXImage": return "image"
+            case "AXCell", "AXRow": return "cell"
+            case "AXStaticText": return "text"
+            default: return "element"
+            }
+        }
+
+        func walk(_ node: AXUIElement, depth: Int) {
+            guard depth < 12 else { return }
+            if Date() > deadline { return }
+
+            let role = stringAttribute(node, attribute: kAXRoleAttribute) ?? ""
+            if pointableOnly.contains(role) {
+                let title = stringAttribute(node, attribute: kAXTitleAttribute) ?? ""
+                let description = stringAttribute(node, attribute: kAXDescriptionAttribute) ?? ""
+                let value = stringAttribute(node, attribute: kAXValueAttribute) ?? ""
+                let rawLabel = !title.isEmpty ? title : (!description.isEmpty ? description : value)
+                // Trim + cap — we want short, human-readable labels. A
+                // 300-char value (long text-field contents) isn't useful
+                // as a mark and bloats the prompt.
+                let trimmed = rawLabel
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "\n", with: " ")
+                guard !trimmed.isEmpty, trimmed.count <= 60 else {
+                    // Still recurse into children even when this node
+                    // has no good label of its own.
+                    var childrenRef: AnyObject?
+                    if AXUIElementCopyAttributeValue(node, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                       let children = childrenRef as? [AXUIElement] {
+                        for child in children {
+                            if Date() > deadline { return }
+                            walk(child, depth: depth + 1)
+                        }
+                    }
+                    return
+                }
+                let isExplicitlyDisabled = boolAttribute(node, attribute: kAXEnabledAttribute) == false
+                if !isExplicitlyDisabled, let frame = elementFrame(node),
+                   frame.width > 0, frame.height > 0,
+                   frame.width < 800, frame.height < 800 {
+                    let screenFrame = cgToAppKitFrame(frame)
+                    if NSScreen.screens.contains(where: { $0.frame.intersects(screenFrame) }) {
+                        collected.append(ElementMark(
+                            role: shortRole(role),
+                            label: trimmed,
+                            center: CGPoint(x: screenFrame.midX, y: screenFrame.midY)
+                        ))
+                    }
+                }
+            }
+
+            var childrenRef: AnyObject?
+            if AXUIElementCopyAttributeValue(node, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                for child in children {
+                    if Date() > deadline { return }
+                    walk(child, depth: depth + 1)
+                }
+            }
+        }
+
+        walk(targetApp, depth: 0)
+        if let menuBar = menuBar(of: targetApp) {
+            walk(menuBar, depth: 0)
+        }
+
+        // Dedupe by (role, label) — AX trees often expose the same label
+        // on both a pointable parent and its static-text child, which
+        // wastes prompt budget.
+        var seen = Set<String>()
+        let deduped = collected.filter { mark in
+            let key = "\(mark.role):\(mark.label.lowercased())"
+            return seen.insert(key).inserted
+        }
+
+        // Sort visually (top-to-bottom, left-to-right) so Gemini's scan
+        // of the mark list mirrors how a human reads the screen.
+        let sorted = deduped.sorted { lhs, rhs in
+            // AppKit Y grows upward — higher Y means higher on screen.
+            if abs(lhs.center.y - rhs.center.y) > 20 {
+                return lhs.center.y > rhs.center.y
+            }
+            return lhs.center.x < rhs.center.x
+        }
+
+        return Array(sorted.prefix(maxElements))
+    }
+
+    /// Render a list of marks as a single-line compact string for the
+    /// Gemini system prompt or side-channel text. Format:
+    /// "[button:Save] [menu:File] [tab:Edit]"
+    static func formatMarks(_ marks: [ElementMark]) -> String {
+        marks.map { "[\($0.role):\($0.label)]" }.joined(separator: " ")
+    }
+
     /// Find the best matching element by title in the frontmost app's AX tree.
     /// Returns nil if the app has no AX tree (Blender-like), or no element matches.
     ///

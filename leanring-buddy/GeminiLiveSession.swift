@@ -326,6 +326,14 @@ final class GeminiLiveSession: ObservableObject {
     /// AX tree lookup fails. Keeping this method lightweight is critical
     /// for audio stability: heavy periodic work starves Core Audio and
     /// causes Gemini's voice to stutter.
+    ///
+    /// Alongside each screenshot we also send a compact "set of marks"
+    /// — a list of [role:label] tokens derived from the current app's
+    /// AX tree. This gives Gemini ground-truth element labels to
+    /// reference in tool calls instead of guessing from the screenshot.
+    /// On apps without an AX tree (Blender/games/canvas) the walk
+    /// returns nil and we just send the screenshot; Gemini falls back
+    /// to its vision-only behavior for those.
     private func captureAndProcessFrameForGemini() async {
         guard let screenshots = try? await CompanionScreenCaptureUtility.captureAllScreensAsJPEG(),
               let primaryCapture = screenshots.first else {
@@ -334,7 +342,37 @@ final class GeminiLiveSession: ObservableObject {
 
         latestCapture = primaryCapture
         geminiClient.sendScreenshot(primaryCapture.imageData)
+
+        // Marks walk runs off-main at background priority so the CoreML
+        // / Audio threads always take precedence — the AX walk is
+        // cheap (<200ms worst case) but we don't want it contending
+        // with Gemini's real-time voice pipeline.
+        let lastSentMarks = lastSentSetOfMarks
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            let resolver = AccessibilityTreeResolver()
+            let targetAppHint = AccessibilityTreeResolver.userTargetAppOverride?.localizedName
+            guard let marks = resolver.setOfMarksForTargetApp(hint: targetAppHint), !marks.isEmpty else {
+                return
+            }
+            let formatted = AccessibilityTreeResolver.formatMarks(marks)
+            // Skip if identical to what we sent last time — keeps
+            // Gemini's context lean during static screens and avoids
+            // paying tokens to re-send the same mark list every 3s.
+            if formatted == lastSentMarks {
+                return
+            }
+            await MainActor.run { self.lastSentSetOfMarks = formatted }
+            let preamble = "UI elements on screen (use these exact labels in tool calls):\n"
+            self.geminiClient.sendText(preamble + formatted)
+        }
     }
+
+    /// The last set-of-marks string we sent to Gemini. Cached so we can
+    /// skip re-sending unchanged marks — set-of-marks text is several
+    /// KB and would otherwise bloat the conversation context on long
+    /// sessions where the screen doesn't change much.
+    private var lastSentSetOfMarks: String = ""
 
     /// Decode JPEG Data into a CGImage for detector input.
     private static func cgImage(from jpegData: Data) -> CGImage? {
