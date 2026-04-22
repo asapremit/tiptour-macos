@@ -3,27 +3,26 @@ import { YoutubeTranscript } from "youtube-transcript";
 /**
  * TipTour Proxy Worker
  *
- * Proxies requests to Claude and ElevenLabs APIs so the app never
- * ships with raw API keys. Keys are stored as Cloudflare secrets.
+ * Thin Cloudflare Worker that proxies the Gemini API calls and the
+ * YouTube-transcript → Gemini guide-generation pipeline, so the app
+ * ships without raw API keys. Keys are stored as Cloudflare secrets.
  *
  * Routes:
- *   POST /chat  → Anthropic Messages API (streaming)
- *   POST /tts   → ElevenLabs TTS API
+ *   GET  /gemini-live-key  → returns the Gemini API key so the app can
+ *                            open a direct WebSocket to Gemini Live.
+ *   POST /generate-guide   → Gemini 2.5 Flash for turning a YouTube
+ *                            transcript into a structured tutorial guide.
+ *   POST /transcript       → Fetches a YouTube transcript by video ID.
  */
 
 interface Env {
-  ANTHROPIC_API_KEY: string;
-  ELEVENLABS_API_KEY: string;
-  ELEVENLABS_VOICE_ID: string;
   GEMINI_API_KEY: string;
-  OPENROUTER_API_KEY: string;
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // GET endpoints — currently just /gemini-live-key
     if (request.method === "GET") {
       if (url.pathname === "/gemini-live-key") {
         return handleGeminiLiveKey(env);
@@ -36,18 +35,6 @@ export default {
     }
 
     try {
-      if (url.pathname === "/chat") {
-        return await handleChat(request, env);
-      }
-
-      if (url.pathname === "/tts") {
-        return await handleTTS(request, env);
-      }
-
-      if (url.pathname === "/chat-fast") {
-        return await handleChatFast(request, env);
-      }
-
       if (url.pathname === "/generate-guide") {
         return await handleGenerateGuide(request, env);
       }
@@ -66,37 +53,6 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
-
-async function handleChat(request: Request, env: Env): Promise<Response> {
-  const body = await request.text();
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body,
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`[/chat] Anthropic API error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, {
-      status: response.status,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "text/event-stream",
-      "cache-control": "no-cache",
-    },
-  });
-}
 
 async function handleTranscript(request: Request): Promise<Response> {
   const { videoID } = await request.json() as { videoID: string };
@@ -156,42 +112,6 @@ async function handleGenerateGuide(request: Request, env: Env): Promise<Response
   });
 }
 
-async function handleChatFast(request: Request, env: Env): Promise<Response> {
-  const body = await request.text();
-  const parsed = JSON.parse(body);
-
-  // Override model to use a fast one via OpenRouter
-  parsed.model = parsed.model || "google/gemma-4-31b-it";
-
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://tiptour.io",
-      "X-Title": "TipTour",
-    },
-    body: JSON.stringify(parsed),
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`[/chat-fast] OpenRouter error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, {
-      status: response.status,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "application/json",
-      "cache-control": "no-cache",
-    },
-  });
-}
-
 /**
  * Returns the Gemini API key so the app can open a direct WebSocket
  * to the Gemini Live API. Cloudflare Workers can't cleanly proxy
@@ -213,38 +133,4 @@ function handleGeminiLiveKey(env: Env): Response {
     JSON.stringify({ apiKey: env.GEMINI_API_KEY }),
     { headers: { "content-type": "application/json", "cache-control": "no-cache" } }
   );
-}
-
-async function handleTTS(request: Request, env: Env): Promise<Response> {
-  const body = await request.text();
-  const voiceId = env.ELEVENLABS_VOICE_ID;
-
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": env.ELEVENLABS_API_KEY,
-        "content-type": "application/json",
-        accept: "audio/mpeg",
-      },
-      body,
-    }
-  );
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`[/tts] ElevenLabs API error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, {
-      status: response.status,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "audio/mpeg",
-    },
-  });
 }

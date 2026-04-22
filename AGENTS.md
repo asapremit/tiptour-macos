@@ -14,11 +14,10 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **Voice Mode**: User-selectable — `geminiLive` (primary, single-model realtime WebSocket with tool calls) or `claudeAndElevenLabs` (legacy 3-stage pipeline)
-- **Gemini Live mode (primary)**: Single WebSocket to `gemini-2.5-flash-native-audio-preview-12-2025` — bidirectional voice (PCM16 16kHz in, PCM16 24kHz out), vision (JPEG screenshots), text transcription, AND tool calling all in one streaming connection. Two tools exposed: `point_at_element(label)` for single-click asks, `submit_workflow_plan(goal, app, steps)` for multi-step walkthroughs. Gemini produces workflow plans itself inside its tool call — no separate planner model. API key fetched from Worker's `/gemini-live-key` endpoint.
-- **Claude mode (legacy)**: Apple Speech STT → Claude (Sonnet/Opus) via Worker `/chat` → ElevenLabs TTS via Worker `/tts`. Kept for comparison; no AssemblyAI dependency.
+- **Voice Mode**: Gemini Live only. Single-model realtime WebSocket to `gemini-3.1-flash-live-preview` — bidirectional voice (PCM16 16kHz in, PCM16 24kHz out), vision (JPEG screenshots), text transcription, AND tool calling all in one streaming connection. Two tools exposed: `point_at_element(label)` for single-click asks, `submit_workflow_plan(goal, app, steps)` for multi-step walkthroughs. Gemini produces workflow plans itself inside its tool call — no separate planner model. API key fetched from Worker's `/gemini-live-key` endpoint.
+- **Legacy voice code** (Apple Speech STT → Claude → ElevenLabs) remains compiled but has no user-visible UI to select it. The code paths are candidate for deletion in a future cleanup.
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
-- **Voice Input**: Gemini Live mode streams mic audio directly over the WebSocket. Claude mode uses Apple Speech on-device STT. Hotkey is a listen-only CGEvent tap so modifier-only shortcuts (ctrl+opt) work reliably in background.
+- **Voice Input**: Gemini Live mode streams mic audio directly over the WebSocket. Hotkey is a listen-only CGEvent tap so modifier-only shortcuts (ctrl+opt) work reliably in background.
 - **Element Pointing**: The LLM calls one of two tools. `ElementResolver` resolves the `label` argument to pixel positions via a three-tier lookup:
     1. **macOS Accessibility tree** — pixel-perfect, ~30ms. Works on native Mac apps, most Electron apps, and anywhere a well-formed AX tree is exposed.
     2. **YOLO + OCR visual detection** — fallback for apps without good AX support (Blender, games, some web content). Uses step 1's optional `x,y` hint as proximity anchor.
@@ -35,16 +34,12 @@ The app never calls external APIs directly. All requests go through a Cloudflare
 | Route | Upstream | Purpose |
 |-------|----------|---------|
 | `GET /gemini-live-key` | — (returns secret) | Returns the Gemini API key so the app can open a direct WebSocket to Gemini Live. Cloudflare Workers can't proxy Gemini's WebSocket so we expose the key to trusted clients. |
-| `POST /chat` | `api.anthropic.com/v1/messages` | Claude vision + streaming chat (legacy voice mode only) |
-| `POST /tts` | `api.elevenlabs.io/v1/text-to-speech/{voiceId}` | ElevenLabs TTS (legacy voice mode only) |
-| `POST /chat-fast` | `openrouter.ai/api/v1/chat/completions` | Fast vision model for tutorial-step fallback pointing |
 | `POST /generate-guide` | `generativelanguage.googleapis.com/.../gemini-2.5-flash` | Gemini guide generation from YouTube transcripts |
 | `POST /transcript` | `youtube-transcript` (npm package) | Fetches YouTube video transcripts |
 
-Worker secrets: `GEMINI_API_KEY`, `ANTHROPIC_API_KEY` (legacy), `ELEVENLABS_API_KEY` (legacy), `OPENROUTER_API_KEY`
-Worker vars: `ELEVENLABS_VOICE_ID`
+Worker secret: `GEMINI_API_KEY`
 
-Removed previously: `/plan` (Gemini now plans inside its own tool call via Gemini Live — no separate planner round-trip), `/transcribe-token` + `ASSEMBLYAI_API_KEY` (Gemini Live does STT in-stream; Claude mode now uses on-device Apple Speech).
+Removed previously: `/chat` + `ANTHROPIC_API_KEY` + `ELEVENLABS_API_KEY` + `/tts` + `/chat-fast` + `OPENROUTER_API_KEY` + `ELEVENLABS_VOICE_ID` (Gemini-only shipping default, the Claude + ElevenLabs + OpenRouter legacy pipelines are no longer reachable from the UI); `/plan` (Gemini now plans inside its own tool call); `/transcribe-token` + `ASSEMBLYAI_API_KEY` (Gemini Live does STT in-stream).
 
 ### Key Architecture Decisions
 
@@ -109,15 +104,13 @@ open tiptour-macos.xcodeproj
 cd worker
 npm install
 
-# Add secrets
-npx wrangler secret put ANTHROPIC_API_KEY
-npx wrangler secret put ASSEMBLYAI_API_KEY
-npx wrangler secret put ELEVENLABS_API_KEY
+# Add secret
+npx wrangler secret put GEMINI_API_KEY
 
 # Deploy
 npx wrangler deploy
 
-# Local dev (create worker/.dev.vars with your keys)
+# Local dev (create worker/.dev.vars with GEMINI_API_KEY=...)
 npx wrangler dev
 ```
 
