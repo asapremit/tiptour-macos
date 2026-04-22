@@ -547,7 +547,7 @@ final class CompanionManager: ObservableObject {
         case geminiLive            // Single Gemini Live WebSocket (voice + vision + voice)
     }
 
-    @Published var voiceMode: VoiceMode = VoiceMode(rawValue: UserDefaults.standard.string(forKey: "voiceMode") ?? "") ?? .claudeAndElevenLabs
+    @Published var voiceMode: VoiceMode = VoiceMode(rawValue: UserDefaults.standard.string(forKey: "voiceMode") ?? "") ?? .geminiLive
 
     func setVoiceMode(_ mode: VoiceMode) {
         voiceMode = mode

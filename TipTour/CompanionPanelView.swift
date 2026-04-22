@@ -33,13 +33,9 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
             }
 
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 12)
-
-                modelPickerRow
-                    .padding(.horizontal, 16)
-            }
+            // Voice-mode / Claude-model picker hidden — TipTour ships
+            // Gemini-only. Claude/ElevenLabs code paths remain compiled
+            // but are no longer user-selectable.
 
             if !companionManager.allPermissionsGranted {
                 Spacer()
