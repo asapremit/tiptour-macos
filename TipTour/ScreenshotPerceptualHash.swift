@@ -1,6 +1,6 @@
 //
 //  ScreenshotPerceptualHash.swift
-//  leanring-buddy
+//  TipTour
 //
 
 //  Cheap perceptual hash (dHash) for skipping near-identical screenshots

@@ -1,6 +1,6 @@
 //
 //  RetryWithExponentialBackoff.swift
-//  leanring-buddy
+//  TipTour
 //
 //  Generic retry helper with exponential backoff. Adapted from
 //  github.com/paradigms-of-intelligence/swift-gemini-api/Sources/swift-gemini-api/Retry.swift

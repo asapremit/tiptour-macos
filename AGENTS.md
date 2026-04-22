@@ -93,7 +93,7 @@ Removed previously: `/plan` (Gemini now plans inside its own tool call via Gemin
 
 ```bash
 # Open in Xcode
-open leanring-buddy.xcodeproj
+open TipTour.xcodeproj
 
 # Select the TipTour scheme, set signing team, Cmd+R to build and run
 
