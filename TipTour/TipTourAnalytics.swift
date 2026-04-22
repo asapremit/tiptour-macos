@@ -38,21 +38,6 @@ enum TipTourAnalytics {
         PostHogSDK.shared.capture("onboarding_started")
     }
 
-    /// User clicked "Watch Onboarding Again" from the panel footer.
-    static func trackOnboardingReplayed() {
-        PostHogSDK.shared.capture("onboarding_replayed")
-    }
-
-    /// The onboarding video finished playing to the end.
-    static func trackOnboardingVideoCompleted() {
-        PostHogSDK.shared.capture("onboarding_video_completed")
-    }
-
-    /// The 40s onboarding demo interaction where TipTour points at something.
-    static func trackOnboardingDemoTriggered() {
-        PostHogSDK.shared.capture("onboarding_demo_triggered")
-    }
-
     // MARK: - Permissions
 
     /// All three permissions (accessibility, screen recording, mic) are granted.

@@ -510,7 +510,6 @@ struct BlueCursorView: View {
         .onDisappear {
             timer?.invalidate()
             navigationAnimationTimer?.invalidate()
-            companionManager.tearDownOnboardingVideo()
         }
         .onChange(of: companionManager.tutorialActionType) { actionType in
             if actionType == "scroll" {

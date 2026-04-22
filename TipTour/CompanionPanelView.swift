@@ -1230,12 +1230,6 @@ struct CompanionPanelView: View {
                 NotificationCenter.default.post(name: .tipTourDismissPanel, object: nil)
             }
 
-            devToolRow("Toggle Mute Video", systemImage: "speaker.slash") {
-                companionManager.onboardingVideoPlayer?.isMuted.toggle()
-            }
-
-            devToolDivider
-
             devToolRow("Reset All", systemImage: "xmark.circle", destructive: true) {
                 companionManager.clearDetectedElementLocation()
                 companionManager.onboardingPromptText = ""

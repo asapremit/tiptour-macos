@@ -17,14 +17,14 @@
 			containerPortal = 28F22CB72F56440300A0FC59 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 28F22CBE2F56440300A0FC59;
-			remoteInfo = "TipTour";
+			remoteInfo = TipTour;
 		};
 		28F22CD72F56440300A0FC59 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 28F22CB72F56440300A0FC59 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 28F22CBE2F56440300A0FC59;
-			remoteInfo = "TipTour";
+			remoteInfo = TipTour;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -37,17 +37,17 @@
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		28F22CC12F56440300A0FC59 /* TipTour */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "TipTour";
+			path = TipTour;
 			sourceTree = "<group>";
 		};
 		28F22CCF2F56440300A0FC59 /* TipTourTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "TipTourTests";
+			path = TipTourTests;
 			sourceTree = "<group>";
 		};
 		28F22CD92F56440300A0FC59 /* TipTourUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "TipTourUITests";
+			path = TipTourUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -122,7 +122,7 @@
 				AA00BB022F6500020039DA55 /* Sparkle */,
 				AA00BB052F6500050039DA55 /* PostHog */,
 			);
-			productName = "TipTour";
+			productName = TipTour;
 			productReference = 28F22CBF2F56440300A0FC59 /* TipTour.app */;
 			productType = "com.apple.product-type.application";
 		};
@@ -145,7 +145,7 @@
 			name = "tiptour-macosTests";
 			packageProductDependencies = (
 			);
-			productName = "TipTourTests";
+			productName = TipTourTests;
 			productReference = 28F22CCC2F56440300A0FC59 /* tiptour-macosTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
@@ -168,7 +168,7 @@
 			name = "tiptour-macosUITests";
 			packageProductDependencies = (
 			);
-			productName = "TipTourUITests";
+			productName = TipTourUITests;
 			productReference = 28F22CD62F56440300A0FC59 /* tiptour-macosUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
@@ -407,7 +407,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = "TipTour/TipTour.entitlements";
+				CODE_SIGN_ENTITLEMENTS = TipTour/TipTour.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -418,7 +418,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = "TipTour/Info.plist";
+				INFOPLIST_FILE = TipTour/Info.plist;
 				INFOPLIST_KEY_AnthropicAPIURL = "https://api.anthropic.com/v1/messages";
 				INFOPLIST_KEY_AnthropicModel = "claude-sonnet-4-6";
 				INFOPLIST_KEY_CFBundleDisplayName = TipTour;
@@ -430,7 +430,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.milindsoni.tiptour";
+				PRODUCT_BUNDLE_IDENTIFIER = com.milindsoni.tiptour;
 				PRODUCT_NAME = TipTour;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -447,7 +447,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = "TipTour/TipTour.entitlements";
+				CODE_SIGN_ENTITLEMENTS = TipTour/TipTour.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -458,7 +458,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = "TipTour/Info.plist";
+				INFOPLIST_FILE = TipTour/Info.plist;
 				INFOPLIST_KEY_AnthropicAPIURL = "https://api.anthropic.com/v1/messages";
 				INFOPLIST_KEY_AnthropicModel = "claude-sonnet-4-6";
 				INFOPLIST_KEY_CFBundleDisplayName = TipTour;
@@ -470,7 +470,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.milindsoni.tiptour";
+				PRODUCT_BUNDLE_IDENTIFIER = com.milindsoni.tiptour;
 				PRODUCT_NAME = TipTour;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -492,7 +492,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.milindsoni.tiptour.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.milindsoni.tiptour.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -513,7 +513,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.milindsoni.tiptour.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.milindsoni.tiptour.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -532,14 +532,14 @@
 				DEVELOPMENT_TEAM = 6D7X9GGZAW;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.milindsoni.tiptour.uitests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.milindsoni.tiptour.uitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TEST_TARGET_NAME = "TipTour";
+				TEST_TARGET_NAME = TipTour;
 			};
 			name = Debug;
 		};
@@ -551,14 +551,14 @@
 				DEVELOPMENT_TEAM = 6D7X9GGZAW;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.milindsoni.tiptour.uitests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.milindsoni.tiptour.uitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TEST_TARGET_NAME = "TipTour";
+				TEST_TARGET_NAME = TipTour;
 			};
 			name = Release;
 		};
