@@ -76,13 +76,13 @@ final class GeminiLiveSession: ObservableObject {
     /// return a short dictionary describing the result. That dictionary is
     /// sent back to Gemini as the tool response so it can continue narrating
     /// with knowledge of what was pointed at.
-    var onPointAtElement: ((_ label: String, _ screenshotJPEG: Data?) async -> [String: Any])?
+    var onPointAtElement: ((_ id: String, _ label: String, _ screenshotJPEG: Data?) async -> [String: Any])?
 
     /// Fired when Gemini calls `submit_workflow_plan(goal, app, steps)`.
     /// Gemini produces the plan itself via its own vision + reasoning, so
     /// the handler just hands the steps off to WorkflowRunner and returns
     /// an acknowledgement — no separate planner round-trip needed.
-    var onSubmitWorkflowPlan: ((_ goal: String, _ app: String, _ steps: [[String: Any]]) async -> [String: Any])?
+    var onSubmitWorkflowPlan: ((_ id: String, _ goal: String, _ app: String, _ steps: [[String: Any]]) async -> [String: Any])?
 
     // MARK: - Dependencies
 
@@ -729,7 +729,7 @@ final class GeminiLiveSession: ObservableObject {
             case "point_at_element":
                 let label = (args["label"] as? String) ?? ""
                 if !label.isEmpty, let handler = onPointAtElement {
-                    response = await handler(label, screenshot)
+                    response = await handler(id, label, screenshot)
                 } else {
                     print("[GeminiLiveSession] point_at_element called with no handler or empty label")
                 }
@@ -739,7 +739,7 @@ final class GeminiLiveSession: ObservableObject {
                 let app = (args["app"] as? String) ?? ""
                 let steps = (args["steps"] as? [[String: Any]]) ?? []
                 if !goal.isEmpty, !steps.isEmpty, let handler = onSubmitWorkflowPlan {
-                    response = await handler(goal, app, steps)
+                    response = await handler(id, goal, app, steps)
                 } else {
                     print("[GeminiLiveSession] submit_workflow_plan called with no handler or empty steps")
                 }

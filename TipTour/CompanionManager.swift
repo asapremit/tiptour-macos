@@ -568,11 +568,11 @@ final class CompanionManager: ObservableObject {
         // the request is a single-element point or a multi-step workflow.
         // Fast path (simple): point_at_element → local AX + YOLO resolve.
         // Smart path (complex): create_workflow → Gemini Flash planner.
-        session.onPointAtElement = { [weak self] label, screenshotJPEG in
-            await self?.handleToolPointAtElement(label: label, screenshotJPEG: screenshotJPEG) ?? ["ok": false]
+        session.onPointAtElement = { [weak self] id, label, screenshotJPEG in
+            await self?.handleToolPointAtElement(id: id, label: label, screenshotJPEG: screenshotJPEG) ?? ["ok": false]
         }
-        session.onSubmitWorkflowPlan = { [weak self] goal, app, steps in
-            await self?.handleToolSubmitWorkflowPlan(goal: goal, app: app, steps: steps) ?? ["ok": false]
+        session.onSubmitWorkflowPlan = { [weak self] id, goal, app, steps in
+            await self?.handleToolSubmitWorkflowPlan(id: id, goal: goal, app: app, steps: steps) ?? ["ok": false]
         }
 
         // Legacy transcript-tag parsing stays in place as a fallback if a
@@ -592,6 +592,7 @@ final class CompanionManager: ObservableObject {
             let isNewUtterance = fullInputTranscript.trimmingCharacters(in: .whitespacesAndNewlines).count > 0
                 && self.previousInputTranscriptLength == 0
             if isNewUtterance {
+                self.handledToolCallIDsThisUtterance.removeAll()
                 self.planAppliedThisTurn = false
                 self.lastGeminiTranscriptLength = 0
             }
@@ -619,14 +620,18 @@ final class CompanionManager: ObservableObject {
     /// short dictionary describing the outcome so Gemini can narrate with
     /// confidence (e.g. "there it is on the top-right").
     @MainActor
-    private func handleToolPointAtElement(label: String, screenshotJPEG: Data?) async -> [String: Any] {
-        // Same duplicate-tool-call protection as submit_workflow_plan —
-        // Gemini Live occasionally emits the inline + envelope form of
-        // the same call, and we don't want to fly the cursor twice.
-        if planAppliedThisTurn {
-            print("[Tool] ⏭️  ignoring duplicate point_at_element (already applied this turn)")
+    private func handleToolPointAtElement(id: String, label: String, screenshotJPEG: Data?) async -> [String: Any] {
+        // Dedup by tool-call ID. Gemini Live occasionally emits the
+        // SAME function call twice in one turn (once inline in
+        // modelTurn.parts, once as a top-level toolCall envelope) —
+        // both copies share the same id. Different legitimate tool
+        // calls within the same utterance get different IDs and both
+        // execute normally.
+        if handledToolCallIDsThisUtterance.contains(id) {
+            print("[Tool] ⏭️  ignoring duplicate point_at_element id=\(id)")
             return ["ok": true, "duplicate": true]
         }
+        handledToolCallIDsThisUtterance.insert(id)
         print("[Tool] 🔧 point_at_element(label=\"\(label)\")")
         let startedAt = Date()
         planAppliedThisTurn = true
@@ -668,20 +673,19 @@ final class CompanionManager: ObservableObject {
     /// of the runner. No separate planner round-trip, no OpenRouter,
     /// no /plan endpoint, no 3-6s wait.
     @MainActor
-    private func handleToolSubmitWorkflowPlan(goal: String, app: String, steps: [[String: Any]]) async -> [String: Any] {
-        // Gemini Live sometimes emits the SAME function call twice in one
-        // turn — once inline inside modelTurn.parts and once as a
-        // top-level toolCall envelope. If we start the workflow and
-        // send a toolResponse twice for the same id, Gemini's server
-        // treats the second response as a new turn trigger, interrupts
-        // its own narration mid-sentence and re-narrates from the top.
-        // Gate on `planAppliedThisTurn` so the duplicate is a cheap no-op.
-        // The flag resets on turnComplete so the next real question
-        // goes through normally.
-        if planAppliedThisTurn {
-            print("[Tool] ⏭️  ignoring duplicate submit_workflow_plan (already applied this turn)")
+    private func handleToolSubmitWorkflowPlan(id: String, goal: String, app: String, steps: [[String: Any]]) async -> [String: Any] {
+        // Dedup by tool-call ID. Same reasoning as handleToolPointAtElement:
+        // Gemini occasionally emits the SAME function call twice (inline
+        // + envelope) with the same id. Different legitimate calls
+        // (e.g. an earlier point_at_element that Gemini later supersedes
+        // with this full workflow plan) get different IDs and both
+        // execute. This handler supersedes any prior point_at_element
+        // state — the workflow runner will drive the cursor from step 1.
+        if handledToolCallIDsThisUtterance.contains(id) {
+            print("[Tool] ⏭️  ignoring duplicate submit_workflow_plan id=\(id)")
             return ["ok": true, "duplicate": true]
         }
+        handledToolCallIDsThisUtterance.insert(id)
         print("[Tool] 🔧 submit_workflow_plan(goal=\"\(goal)\", app=\"\(app)\", \(steps.count) steps)")
         planAppliedThisTurn = true
 
@@ -812,6 +816,19 @@ final class CompanionManager: ObservableObject {
 
     /// Track whether a plan has already been applied this turn so the
     /// transcript-tag path doesn't overwrite it with a stale [POINT:].
+    /// Set of tool-call IDs we've already dispatched within the current
+    /// user utterance. Gemini Live occasionally emits the SAME function
+    /// call twice in one turn (once inline in modelTurn.parts, once as
+    /// a top-level toolCall envelope) — both copies share the same id,
+    /// so ID-based dedup catches them. But legitimately different tool
+    /// calls within the same turn (e.g. a refined point_at_element →
+    /// submit_workflow_plan) get different IDs and both execute.
+    /// Reset when a new user utterance starts.
+    private var handledToolCallIDsThisUtterance: Set<String> = []
+
+    /// Set by the legacy [POINT:] transcript-tag path so it doesn't
+    /// fight a plan that was emitted by a proper tool call in the same
+    /// turn. Reset alongside the ID set on new utterance.
     private var planAppliedThisTurn: Bool = false
 
     /// Tracks how long the input transcript was on the last update so
