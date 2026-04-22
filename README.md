@@ -119,7 +119,7 @@ npx wrangler deploy
 ### 2. Open + run
 
 ```bash
-open TipTour.xcodeproj
+open tiptour-macos.xcodeproj
 ```
 
 Set your signing team in Target → Signing & Capabilities, then `Cmd+R`. TipTour appears in your menu bar — no dock icon, no main window.
@@ -150,7 +150,7 @@ TipTour asks for four macOS permissions on first launch. Grant them in System Se
 PRs welcome. For non-trivial changes, open an issue first.
 
 Before submitting:
-1. Open `TipTour.xcodeproj` in Xcode → verify it builds
+1. Open `tiptour-macos.xcodeproj` in Xcode → verify it builds
 2. Any new permission requests need matching `NS*UsageDescription` in `Info.plist`
 3. Run through the push-to-talk flow end-to-end once to catch regressions
 
