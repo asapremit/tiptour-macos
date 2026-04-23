@@ -10,7 +10,6 @@ A voice-powered teacher for every Mac app. Say what you want — TipTour sees yo
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Platform: macOS 14+](https://img.shields.io/badge/Platform-macOS%2014+-black)](https://www.apple.com/macos)
-[![Built on Clicky](https://img.shields.io/badge/Built_on-Clicky-blue)](https://github.com/farzaa/clicky)
 
 </div>
 
