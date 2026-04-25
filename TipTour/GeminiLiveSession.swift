@@ -268,6 +268,19 @@ final class GeminiLiveSession: ObservableObject {
     /// a live socket for text-driven narration.
     private(set) var isInNarrationMode: Bool = false
 
+    /// True after a successful tool call until the user speaks again.
+    /// While this is set, `captureAndProcessFrameForGemini` skips the
+    /// network push of fresh screenshots. The mic stays live, so the
+    /// moment Gemini hears the user speak (any inputTranscript chunk),
+    /// the flag clears and screenshots resume.
+    ///
+    /// Why: after a tool call succeeds (cursor pointed at File, plan
+    /// submitted, etc.), Gemini interprets every subsequent screenshot
+    /// of "user hasn't moved yet" as "user still needs help" and
+    /// re-emits the same tool call. The user reads/acts at human
+    /// speed; we have to mute the visual stream to stop the loop.
+    private(set) var areScreenshotsSuppressedUntilUserSpeaks: Bool = false
+
     /// Pause mic capture and periodic screenshots while keeping the
     /// WebSocket and audio player alive. Use this while Gemini is
     /// speaking a post-tool-call narration so its own speech doesn't
@@ -279,6 +292,28 @@ final class GeminiLiveSession: ObservableObject {
         stopMicCapture()
         isInNarrationMode = true
         print("[GeminiLiveSession] Narration mode entered (mic + screenshots paused)")
+    }
+
+    /// Mark that a tool call was just satisfied, so subsequent
+    /// screenshot pushes should be suppressed until the user speaks.
+    /// CompanionManager calls this after a successful point_at_element
+    /// or submit_workflow_plan. The flag self-clears on the next
+    /// inputTranscript chunk (i.e. the user spoke).
+    func suppressScreenshotsUntilUserSpeaks() {
+        guard isActive else { return }
+        if !areScreenshotsSuppressedUntilUserSpeaks {
+            print("[GeminiLiveSession] 🔇 screenshots suppressed until user speaks")
+        }
+        areScreenshotsSuppressedUntilUserSpeaks = true
+    }
+
+    /// Manually clear the suppression flag — used when CompanionManager
+    /// detects a new push-to-talk press, in case the mic-detected
+    /// inputTranscript signal is delayed.
+    func clearScreenshotSuppression() {
+        guard areScreenshotsSuppressedUntilUserSpeaks else { return }
+        areScreenshotsSuppressedUntilUserSpeaks = false
+        print("[GeminiLiveSession] 🔊 screenshot suppression cleared")
     }
 
     /// Resume mic capture + periodic screenshots after narration
@@ -398,14 +433,20 @@ final class GeminiLiveSession: ObservableObject {
         // network sends.
         latestCapture = primaryCapture
 
-        // While the on-device WorkflowRunner is executing a plan, do
-        // NOT push fresh screenshots to Gemini. Gemini misinterprets
-        // unchanged "user hasn't clicked the highlighted element yet"
-        // frames as "user still needs help" and submits another plan,
-        // which the re-entry guard now rejects but still wastes a turn.
-        // Suppressing the upload removes the trigger entirely so Gemini
-        // sits quiet until either the workflow completes (runner clears
-        // activePlan) or the user speaks (mic stays live for that).
+        // After ANY successful tool call (point_at_element or
+        // submit_workflow_plan), suppress screenshot pushes until the
+        // user speaks again. Without this, Gemini sees frames showing
+        // "user hasn't acted yet" and re-emits the same tool call in
+        // a tight loop. Mic stays live so the moment the user actually
+        // speaks, the inputTranscript handler clears this flag and
+        // screenshots resume.
+        if areScreenshotsSuppressedUntilUserSpeaks {
+            return
+        }
+
+        // Same idea, narrower trigger: while the on-device WorkflowRunner
+        // is executing a plan, never push fresh screenshots regardless
+        // of the suppression flag's state.
         if await MainActor.run(body: { WorkflowRunner.shared.activePlan != nil }) {
             return
         }
@@ -622,6 +663,13 @@ final class GeminiLiveSession: ObservableObject {
             // UI sees the full utterance as it builds up.
             inputTranscript += text
             onInputTranscriptUpdate?(inputTranscript)
+            // Any user speech clears the post-tool-call screenshot
+            // suppression — the user is asking something new and
+            // Gemini should be able to see the screen again.
+            if areScreenshotsSuppressedUntilUserSpeaks {
+                areScreenshotsSuppressedUntilUserSpeaks = false
+                print("[GeminiLiveSession] 🔊 user spoke — screenshots resumed")
+            }
 
         case .outputTranscript(let text):
             outputTranscript += text

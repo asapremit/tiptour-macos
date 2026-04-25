@@ -670,6 +670,12 @@ final class CompanionManager: ObservableObject {
         // later clicks as missed hits on the wrong target.
         ClickDetector.shared.disarm()
 
+        // Mute screenshot pushes until the user speaks again. Without
+        // this, Gemini receives a fresh frame showing the cursor on
+        // the just-pointed element and "user hasn't moved" → re-emits
+        // point_at_element on the same label in a loop.
+        geminiLiveSession.suppressScreenshotsUntilUserSpeaks()
+
         return [
             "ok": true,
             "label": resolution.label,
@@ -751,6 +757,13 @@ final class CompanionManager: ObservableObject {
         let stepLabels = parsedSteps.map { $0.label ?? "<unlabeled>" }
         print("[Tool] ✓ submit_workflow_plan → \(plan.app ?? "?"): \(stepLabels)")
         startWorkflowPlan(plan)
+
+        // Mute screenshot pushes until the user speaks again. The
+        // activePlan check in captureAndProcessFrameForGemini already
+        // covers the lifetime of the plan; this catches the window
+        // AFTER the plan completes too, so a "user reading the result"
+        // frame doesn't trigger a re-plan.
+        geminiLiveSession.suppressScreenshotsUntilUserSpeaks()
 
         // Pause mic + screenshots so Gemini can narrate the plan in one
         // uninterrupted turn. Once the narration finishes we EXIT
@@ -1466,8 +1479,8 @@ final class CompanionManager: ObservableObject {
     - anything needing a sequence → submit_workflow_plan.
     - no UI involvement (pure knowledge or chit-chat) → no tool, just speak.
 
-    PLAN-IN-PROGRESS RULE:
-    after submit_workflow_plan returns ok, the on-device runner takes over and walks the user through the steps. you will continue receiving screenshots that may show the SAME unfulfilled state (cursor still pointing at step 1 because the user hasn't clicked yet — the user reads at human speed). this is NORMAL and EXPECTED. do NOT submit another plan. do NOT call any tool. stay silent and wait. only act again when the user speaks a NEW request. if the toolResponse comes back with reason "plan_already_running", you have hallucinated a re-submit — stop, say nothing, wait for the user.
+    POST-TOOL-CALL SILENCE RULE (CRITICAL):
+    after ANY tool call returns ok (point_at_element OR submit_workflow_plan), the user takes over. they read, they think, they act at human speed — this can take many seconds. during that time you stay COMPLETELY SILENT and call NO tool. do NOT re-point at the same element because "they didn't click yet." do NOT re-submit a plan because "they haven't moved." do NOT helpfully suggest the next step. just wait. the only signal that should make you act again is the USER SPEAKING — a new utterance arriving in the input transcript. screenshots showing an unchanged screen mean nothing; ignore them. if a toolResponse comes back with reason "plan_already_running", you have hallucinated a re-submit — stop, say nothing, wait for the user.
 
     PRE-TOOL-CALL SILENCE:
     if your next action is a tool call, stay completely silent — no filler, no "sure", no "hmm". call the tool, wait for toolResponse, THEN speak. if you speak before the tool call, the user hears a half-word that cuts off when the tool fires.
