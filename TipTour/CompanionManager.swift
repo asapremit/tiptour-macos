@@ -632,6 +632,16 @@ final class CompanionManager: ObservableObject {
             return ["ok": true, "duplicate": true]
         }
         handledToolCallIDsThisUtterance.insert(id)
+        // A point_at_element call means the user is asking about a
+        // specific visible element — not following a multi-step plan.
+        // If a previous workflow is still flagged active (user
+        // abandoned it mid-flight), stop it now so the new ask isn't
+        // blocked by stale state and so ClickDetector doesn't have
+        // a leftover armed rect from the old plan's first step.
+        if let activePlan = WorkflowRunner.shared.activePlan {
+            print("[Tool] 🔄 superseding active plan \"\(activePlan.goal)\" — user asked for a single element \"\(label)\"")
+            WorkflowRunner.shared.stop()
+        }
         print("[Tool] 🔧 point_at_element(label=\"\(label)\")")
         let startedAt = Date()
         planAppliedThisTurn = true
@@ -687,23 +697,26 @@ final class CompanionManager: ObservableObject {
         }
         handledToolCallIDsThisUtterance.insert(id)
 
-        // Re-entry guard: Gemini occasionally re-emits submit_workflow_plan
-        // when it sees a fresh screenshot showing the SAME unfulfilled state
-        // (e.g. cursor still highlighting the first step's element because
-        // the user hasn't clicked yet). Without this guard the runner gets
-        // restarted from step 1 on every screenshot, the click detector is
-        // re-armed, narration mode toggles on/off rapidly (causing the
-        // -10877 CoreAudio errors), and the user is stuck in a loop.
-        // If a plan is already running, tell Gemini to wait — don't accept
-        // another one until the user explicitly cancels or completes the
-        // current one.
+        // Re-entry guard. Two cases:
+        //   1. Same-goal re-submit (Gemini saw an unchanged screenshot
+        //      and hallucinated that the user still needs the plan).
+        //      → reject. Don't restart the runner from step 1.
+        //   2. Different-goal submit (the user asked something new
+        //      while the previous plan was abandoned mid-flight).
+        //      → stop the old plan, accept the new one. Treat the new
+        //      goal as the source of truth — the user moved on.
         if let activePlan = WorkflowRunner.shared.activePlan {
-            print("[Tool] ⏭️  rejecting submit_workflow_plan — plan \"\(activePlan.goal)\" already running (step \(WorkflowRunner.shared.activeStepIndex + 1)/\(activePlan.steps.count))")
-            return [
-                "ok": false,
-                "reason": "plan_already_running",
-                "message": "A plan is already executing on the user's machine. Wait for the user to act or to cancel before submitting another plan. Do not re-submit this plan."
-            ]
+            let isSameGoalAsActivePlan = activePlan.goal.caseInsensitiveCompare(goal) == .orderedSame
+            if isSameGoalAsActivePlan {
+                print("[Tool] ⏭️  rejecting submit_workflow_plan — same-goal re-submit of \"\(activePlan.goal)\" (already on step \(WorkflowRunner.shared.activeStepIndex + 1)/\(activePlan.steps.count))")
+                return [
+                    "ok": false,
+                    "reason": "plan_already_running",
+                    "message": "This exact plan is already executing on the user's machine. The user reads at human speed; an unchanged screenshot is normal. Do not re-submit this plan. Stay silent and wait for the user to speak again."
+                ]
+            }
+            print("[Tool] 🔄 superseding active plan \"\(activePlan.goal)\" with new request \"\(goal)\"")
+            WorkflowRunner.shared.stop()
         }
 
         print("[Tool] 🔧 submit_workflow_plan(goal=\"\(goal)\", app=\"\(app)\", \(steps.count) steps)")
