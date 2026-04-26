@@ -73,6 +73,35 @@ final class CompanionManager: ObservableObject {
     }
     @Published private(set) var tutorialDisplayPhase: TutorialDisplayPhase = .video
 
+    /// Where the tutorial swap surface (video ↔ instruction) renders:
+    ///   .menuBar         → inside the menu bar panel (default).
+    ///                      Panel auto-pins for the duration of the
+    ///                      tutorial so outside clicks don't dismiss it.
+    ///   .cursorFollowing → as a chip that floats next to the cursor
+    ///                      via OverlayWindow, matching the original
+    ///                      Clicky-era pattern.
+    /// Persisted in UserDefaults. Old "pip" values transparently
+    /// migrate to .menuBar.
+    enum TutorialVideoMode: String {
+        case menuBar
+        case cursorFollowing
+    }
+    @Published var tutorialVideoMode: TutorialVideoMode = {
+        let saved = UserDefaults.standard.string(forKey: "tutorialVideoMode") ?? ""
+        if saved == "pip" { return .menuBar }
+        return TutorialVideoMode(rawValue: saved) ?? .menuBar
+    }()
+
+    func setTutorialVideoMode(_ mode: TutorialVideoMode) {
+        tutorialVideoMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "tutorialVideoMode")
+        // If a tutorial is already running, the SwiftUI bindings on
+        // both the menu bar panel and the OverlayWindow react to this
+        // flip automatically — one disappears, the other appears.
+        // The shared YouTubeEmbedController + display phase carry
+        // over so the swap rhythm keeps going.
+    }
+
     /// Transcript text shown during the .instruction phase. Pulled from
     /// the cached transcript segments, sliced to the chunk that just
     /// played. Empty when no transcript is available — the UI falls
@@ -87,6 +116,11 @@ final class CompanionManager: ObservableObject {
 
     /// Drives the alternation between .video and .instruction phases.
     private var tutorialSwapTimer: Timer?
+
+    /// Global key monitor active only while a tutorial is running.
+    /// Listens passively for ⌃⌥+arrow / ⌃⌥+esc to control the swap
+    /// loop without intercepting keys (no extra permissions required).
+    private var tutorialHotkeyMonitor: Any?
 
     /// Cached transcript segments for the active video. Each entry is
     /// (timestampSeconds, text). Filled once at tutorial start.
@@ -135,6 +169,7 @@ final class CompanionManager: ObservableObject {
         // Kick off the alternation loop. First swap fires after the
         // initial video chunk (~10s) plays.
         scheduleNextTutorialSwap(after: tutorialVideoChunkDurationSeconds)
+        installTutorialHotkeyMonitorIfNeeded()
     }
 
     /// Pull the YouTube video ID out of a full watch / share URL.
@@ -168,6 +203,7 @@ final class CompanionManager: ObservableObject {
         tutorialInstructionText = ""
         tutorialTranscriptSegments = []
         tutorialChunkStartSeconds = 0
+        removeTutorialHotkeyMonitor()
     }
 
     // MARK: - Tutorial swap loop
@@ -254,6 +290,65 @@ final class CompanionManager: ObservableObject {
         }
         tutorialEmbedController?.play()
         scheduleNextTutorialSwap(after: tutorialVideoChunkDurationSeconds)
+    }
+
+    // MARK: - Tutorial hotkeys (⌃⌥+arrow / ⌃⌥+esc)
+
+    /// Force the swap loop forward immediately. If we're in the
+    /// .video phase, jump to the .instruction phase right now (don't
+    /// wait the full 10s). If we're in .instruction, jump back to
+    /// .video and start the next chunk.
+    func skipTutorialChunk() {
+        guard isTutorialActive else { return }
+        handleTutorialSwapTick()
+    }
+
+    /// Replay the current chunk: rewind the embed to chunkStart and
+    /// reset the swap loop into .video phase from the top of this
+    /// chunk. Useful when the user missed something and wants to
+    /// re-watch the same 10s.
+    func replayCurrentTutorialChunk() {
+        guard isTutorialActive, let controller = tutorialEmbedController else { return }
+        let chunkStart = tutorialChunkStartSeconds
+        controller.seek(toSeconds: chunkStart)
+        controller.play()
+        withAnimation(.easeInOut(duration: 0.4)) {
+            tutorialDisplayPhase = .video
+        }
+        scheduleNextTutorialSwap(after: tutorialVideoChunkDurationSeconds)
+    }
+
+    /// Install the global key monitor for tutorial controls.
+    /// NSEvent.addGlobalMonitorForEvents is passive (observes only,
+    /// doesn't intercept) so it requires no extra permissions and
+    /// doesn't impact the user's normal typing.
+    private func installTutorialHotkeyMonitorIfNeeded() {
+        guard tutorialHotkeyMonitor == nil else { return }
+        tutorialHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return }
+            // Required modifiers: Control + Option, no Cmd, no Shift.
+            let interestingFlags = event.modifierFlags.intersection([.control, .option, .command, .shift])
+            guard interestingFlags == [.control, .option] else { return }
+
+            // Key codes (US layout): 124=Right, 123=Left, 53=Esc.
+            switch event.keyCode {
+            case 124:
+                Task { @MainActor in self.skipTutorialChunk() }
+            case 123:
+                Task { @MainActor in self.replayCurrentTutorialChunk() }
+            case 53:
+                Task { @MainActor in self.stopTutorial() }
+            default:
+                break
+            }
+        }
+    }
+
+    private func removeTutorialHotkeyMonitor() {
+        if let monitor = tutorialHotkeyMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        tutorialHotkeyMonitor = nil
     }
 
     // MARK: - Transcript fetch

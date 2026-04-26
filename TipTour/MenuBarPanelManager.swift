@@ -259,10 +259,13 @@ final class MenuBarPanelManager: NSObject {
             return
         }
 
-        // Same idea while a tutorial is running — the user must be
-        // able to click around in their app to follow along, and the
-        // embedded video should stay visible the whole time.
-        if companionManager.isTutorialActive {
+        // Same idea while a tutorial is running IN MENU BAR MODE —
+        // the user must be able to click around in their app to follow
+        // along, and the embedded video should stay visible the whole
+        // time. In cursor-following mode the video lives in the
+        // OverlayWindow chip, so the panel can dismiss normally.
+        if companionManager.isTutorialActive
+            && companionManager.tutorialVideoMode == .menuBar {
             return
         }
 

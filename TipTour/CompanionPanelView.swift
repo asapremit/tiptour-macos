@@ -1215,8 +1215,12 @@ struct CompanionPanelView: View {
             // card occupy the same 16:9 frame and cross-fade as the
             // CompanionManager flips tutorialDisplayPhase between
             // .video (embed playing) and .instruction (transcript
-            // chunk shown for the user to act on).
+            // chunk shown for the user to act on). Only renders inline
+            // here when tutorialVideoMode == .menuBar — the cursor-
+            // following mode renders the same swap in OverlayWindow
+            // next to the cursor instead.
             if companionManager.isTutorialActive,
+               companionManager.tutorialVideoMode == .menuBar,
                let embedController = companionManager.tutorialEmbedController,
                let videoID = companionManager.activeTutorialVideoID {
                 tutorialSwapSurface(videoID: videoID, controller: embedController)
@@ -1229,13 +1233,73 @@ struct CompanionPanelView: View {
                 .buttonStyle(.plain)
                 .pointerCursor()
             }
+
+            tutorialVideoModeToggleRow
         }
+    }
+
+    /// Lets the user choose where the tutorial swap surface renders:
+    /// inside this menu bar panel (default) or as a chip following
+    /// the cursor.
+    private var tutorialVideoModeToggleRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "rectangle.on.rectangle")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Colors.textTertiary)
+            Text("Video plays")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.textTertiary)
+            Spacer()
+            HStack(spacing: 0) {
+                tutorialVideoModeOptionButton(label: "Menu Bar", mode: .menuBar)
+                tutorialVideoModeOptionButton(label: "Cursor", mode: .cursorFollowing)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .padding(.top, 4)
+    }
+
+    private func tutorialVideoModeOptionButton(
+        label: String,
+        mode: CompanionManager.TutorialVideoMode
+    ) -> some View {
+        let isSelected = companionManager.tutorialVideoMode == mode
+        return Button(action: {
+            companionManager.setTutorialVideoMode(mode)
+        }) {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(isSelected ? .white : DS.Colors.textTertiary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(isSelected ? DS.Colors.accent : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
     }
 
     /// Stacks the YouTube embed and the instruction card in the same
     /// 16:9 area and cross-fades them based on tutorialDisplayPhase.
     /// The embed stays mounted in both phases (just opacity-toggled)
     /// so we don't lose player state between swaps.
+    ///
+    /// Note: The panel content is 320pt wide minus 16pt of horizontal
+    /// padding on each side = 288pt available. The embed used to use
+    /// `.aspectRatio(.fit)` which collapsed to its (zero) intrinsic
+    /// size on first layout — explicit `.frame(maxWidth: .infinity,
+    /// minHeight:...)` forces a real size from the moment the WKWebView
+    /// loads, so the IFrame Player initializes at the right dimensions
+    /// and doesn't render tiny.
     private func tutorialSwapSurface(videoID: String, controller: YouTubeEmbedController) -> some View {
         ZStack {
             YouTubeEmbedView(videoID: videoID, controller: controller)
@@ -1247,7 +1311,7 @@ struct CompanionPanelView: View {
                 .opacity(companionManager.tutorialDisplayPhase == .instruction ? 1 : 0)
                 .allowsHitTesting(companionManager.tutorialDisplayPhase == .instruction)
         }
-        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+        .frame(maxWidth: .infinity, minHeight: 162, idealHeight: 162)
     }
 
     /// The card shown in place of the embed during the .instruction

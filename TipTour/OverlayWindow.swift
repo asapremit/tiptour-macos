@@ -282,6 +282,64 @@ struct BlueCursorView: View {
                 )
             }
 
+            // Tutorial swap surface (cursor-following mode). Same
+            // ZStack pattern as the menu bar embed: YouTubeEmbedView
+            // and instruction card layered, cross-fading on
+            // tutorialDisplayPhase. The chip is anchored to the right
+            // of the cursor position and is hit-testable so YouTube's
+            // controls remain usable. Only renders when
+            // tutorialVideoMode == .cursorFollowing.
+            if companionManager.isTutorialActive,
+               companionManager.tutorialVideoMode == .cursorFollowing,
+               isCursorOnThisScreen,
+               let embedController = companionManager.tutorialEmbedController,
+               let videoID = companionManager.activeTutorialVideoID {
+                ZStack {
+                    YouTubeEmbedView(videoID: videoID, controller: embedController)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .opacity(companionManager.tutorialDisplayPhase == .video ? 1 : 0)
+                        .allowsHitTesting(companionManager.tutorialDisplayPhase == .video)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "hand.point.up.left.fill")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(DS.Colors.overlayCursorBlue)
+                            Text("Your turn")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.85))
+                            Spacer()
+                        }
+                        Text(companionManager.tutorialInstructionText)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.white)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(6)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.black.opacity(0.78))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(DS.Colors.overlayCursorBlue.opacity(0.45), lineWidth: 1)
+                    )
+                    .opacity(companionManager.tutorialDisplayPhase == .instruction ? 1 : 0)
+                }
+                .frame(width: 360, height: 200)  // 16:9-ish, comfortable reading size
+                .shadow(color: Color.black.opacity(0.5), radius: 14, x: 0, y: 8)
+                .position(
+                    x: cursorPosition.x + 28 + 180,
+                    y: cursorPosition.y + 24 + 100
+                )
+                .animation(.spring(response: 0.25, dampingFraction: 0.7, blendDuration: 0), value: cursorPosition)
+                .animation(.easeInOut(duration: 0.4), value: companionManager.tutorialDisplayPhase)
+            }
+
             // Navigation pointer bubble — shown when buddy arrives at a detected element.
             // Pops in with a scale-bounce (0.5x → 1.0x spring) and a bright initial
             // glow that settles, creating a "materializing" effect.
