@@ -10,16 +10,6 @@
 import AVFoundation
 import SwiftUI
 
-/// Safe array subscript — returns nil instead of crashing when the
-/// index is out of range. Used in the tutorial player section where
-/// `tutorialStepIndex` could briefly fall outside the steps array
-/// during state transitions.
-private extension Array {
-    subscript(safe index: Int) -> Element? {
-        indices.contains(index) ? self[index] : nil
-    }
-}
-
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @ObservedObject private var workflowRunner: WorkflowRunner = .shared
