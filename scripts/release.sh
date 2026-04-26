@@ -33,7 +33,11 @@ export PATH="/opt/homebrew/bin:$PATH"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-SCHEME="TipTour"
+# Xcode scheme name must match what `xcodebuild -list` shows. The
+# scheme is named after the project (tiptour-macos), not the product
+# (TipTour). The built .app is still named TipTour.app because the
+# target's PRODUCT_NAME = TipTour.
+SCHEME="tiptour-macos"
 # .app and .dmg filename. Users see this in Finder ("TipTour.app", "TipTour.dmg").
 APP_NAME="TipTour"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
