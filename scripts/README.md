@@ -1,6 +1,6 @@
 # Release Scripts
 
-## `release.sh` — Ship a new version of makesomething
+## `release.sh` — Ship a new version of TipTour
 
 Automates the full release pipeline: build → sign → DMG → notarize → Sparkle appcast → GitHub Release.
 
@@ -42,21 +42,46 @@ The script checks GitHub for the latest release (e.g. `v1.5`, build 6) and autom
 
 ### One-time setup (prerequisites)
 
-1. **Xcode** with your Developer ID signing certificate
+Run these once on the machine you'll release from:
+
+1. **Apple Developer ID Application certificate** — verify with:
+   ```bash
+   security find-identity -v -p codesigning | grep "Developer ID Application"
+   ```
+   If empty: Xcode → Settings → Accounts → your Apple ID → Manage Certificates → **+** → Developer ID Application.
+
 2. **Homebrew tools**:
    ```bash
    brew install create-dmg gh
    ```
+
 3. **GitHub CLI auth**:
    ```bash
    gh auth login
    ```
-4. **Apple notarization credentials** (stored in Keychain):
+
+4. **Apple notarization credentials** (stored once in Keychain):
    ```bash
    xcrun notarytool store-credentials "AC_PASSWORD" \
-       --apple-id YOUR_APPLE_ID \
-       --team-id YOUR_TEAM_ID
+       --apple-id YOUR_APPLE_ID_EMAIL \
+       --team-id YOUR_10_CHAR_TEAM_ID \
+       --password YOUR_APP_SPECIFIC_PASSWORD
    ```
-   You'll be prompted for an app-specific password (generate one at [appleid.apple.com](https://appleid.apple.com)).
-5. **Sparkle EdDSA key** — already generated and stored in Keychain (done during initial Sparkle setup)
-6. **Build the project in Xcode at least once** so SPM downloads Sparkle and the Sparkle CLI tools are available
+   Generate an app-specific password at [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords. Find your team ID at [developer.apple.com/account](https://developer.apple.com/account) → Membership Details.
+
+5. **Build the project in Xcode at least once** so SPM downloads Sparkle and its CLI tools become available.
+
+6. **Sparkle EdDSA key** — generate once after step 5:
+   ```bash
+   SPARKLE_BIN=$(find ~/Library/Developer/Xcode/DerivedData/TipTour*/SourcePackages/artifacts/sparkle/Sparkle/bin -maxdepth 0 | head -1)
+   "$SPARKLE_BIN/generate_keys"
+   ```
+   Copy the printed **public** key. Open `tiptour-macos.xcodeproj` and replace the placeholder
+   `INFOPLIST_KEY_SUPublicEDKey = "REPLACE_WITH_SPARKLE_PUBLIC_KEY_FROM_generate_keys"`
+   in the project's build settings (search for `SUPublicEDKey` in Build Settings — both Debug and Release configs).
+
+7. **Releases repo** — create a public GitHub repo named `tiptour-releases` (or whatever you set as `GITHUB_REPO` in `release.sh`). The script clones it, pushes the new `appcast.xml`, and creates Releases there. An empty repo with a README is enough.
+
+8. **Update repo URL if needed** — open `release.sh` and change `GITHUB_REPO=` if your releases repo isn't `milind-soni/tiptour-releases`.
+
+After all 8 steps, the first release runs end-to-end with `./scripts/release.sh`.

@@ -5,7 +5,7 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 # =============================================================================
-# release.sh — Automates the full release pipeline for makesomething
+# release.sh — Automates the full release pipeline for TipTour
 #
 # What it does (in order):
 #   1. Auto-detects version + build from the latest GitHub Release
@@ -16,7 +16,7 @@ export PATH="/opt/homebrew/bin:$PATH"
 #   6. Signs the DMG with your Sparkle EdDSA key
 #   7. Generates/updates appcast.xml automatically
 #   8. Creates a GitHub Release with the DMG attached
-#   9. Pushes the updated appcast.xml to the releases repo (makesomething-mac-app)
+#   9. Pushes the updated appcast.xml to the releases repo
 #
 # Usage:
 #   ./scripts/release.sh              Auto-bumps: 1.5 → 1.6, build 6 → 7
@@ -34,7 +34,8 @@ export PATH="/opt/homebrew/bin:$PATH"
 # ── Configuration ────────────────────────────────────────────────────────────
 
 SCHEME="TipTour"
-APP_NAME="makesomething"
+# .app and .dmg filename. Users see this in Finder ("TipTour.app", "TipTour.dmg").
+APP_NAME="TipTour"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${PROJECT_DIR}/build"
 ARCHIVE_PATH="${BUILD_DIR}/${APP_NAME}.xcarchive"
@@ -43,7 +44,11 @@ DMG_OUTPUT_DIR="${BUILD_DIR}/dmg"
 RELEASES_DIR="${PROJECT_DIR}/releases"  # where generate_appcast reads DMGs from
 DMG_BACKGROUND="${PROJECT_DIR}/dmg-background.png"
 
-GITHUB_REPO="julianjear/makesomething-mac-app"
+# Public GitHub repo where DMG releases + the appcast.xml live. Must already
+# exist (init with a README is fine — the script clones it, copies the new
+# appcast.xml in, and pushes back). CHANGE THIS if you used a different name
+# when you created the repo.
+GITHUB_REPO="milind-soni/tiptour-releases"
 
 # Sparkle tools (auto-discovered from Xcode's SPM cache)
 SPARKLE_BIN=$(find ~/Library/Developer/Xcode/DerivedData/TipTour*/SourcePackages/artifacts/sparkle/Sparkle/bin -maxdepth 0 2>/dev/null | head -1)
@@ -245,11 +250,11 @@ echo "🏷️  Creating GitHub Release ${TAG}..."
 gh release create "${TAG}" "${DMG_PATH}" \
     --repo "${GITHUB_REPO}" \
     --title "v${MARKETING_VERSION}" \
-    --notes "makesomething v${MARKETING_VERSION}" \
+    --notes "TipTour v${MARKETING_VERSION}" \
     --latest
 
 # ── Step 9: Push appcast.xml to the releases repo ───────────────────────────
-# The appcast lives in makesomething-mac-app (the releases repo), not in the
+# The appcast lives in the releases repo (GITHUB_REPO above), not in the
 # source code repo. We clone it to a temp dir, copy the new appcast, and push.
 
 echo "📝 Pushing appcast.xml to ${GITHUB_REPO}..."
