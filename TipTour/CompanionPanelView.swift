@@ -1224,18 +1224,63 @@ struct CompanionPanelView: View {
                let embedController = companionManager.tutorialEmbedController,
                let videoID = companionManager.activeTutorialVideoID {
                 tutorialSwapSurface(videoID: videoID, controller: embedController)
-
-                Button(action: { companionManager.stopTutorial() }) {
-                    Text("Stop")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.red.opacity(0.8))
-                }
-                .buttonStyle(.plain)
-                .pointerCursor()
+                tutorialControlsRow
             }
 
             tutorialVideoModeToggleRow
         }
+    }
+
+    /// Row of compact tutorial controls under the swap surface:
+    /// Replay current chunk · Play/Pause · Skip · Stop. Bigger and
+    /// more discoverable than the hotkeys (which still work in
+    /// parallel), and works in both menu-bar and cursor-following
+    /// modes — when the panel is open the user has both options.
+    private var tutorialControlsRow: some View {
+        HStack(spacing: 6) {
+            tutorialIconButton(systemImage: "backward.fill", help: "Replay this chunk") {
+                companionManager.replayCurrentTutorialChunk()
+            }
+            tutorialIconButton(
+                systemImage: companionManager.isTutorialPaused ? "play.fill" : "pause.fill",
+                help: companionManager.isTutorialPaused ? "Resume" : "Pause"
+            ) {
+                companionManager.toggleTutorialPause()
+            }
+            tutorialIconButton(systemImage: "forward.fill", help: "Skip ahead") {
+                companionManager.skipTutorialChunk()
+            }
+            Spacer()
+            tutorialIconButton(systemImage: "stop.fill", help: "Stop", isDestructive: true) {
+                companionManager.stopTutorial()
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func tutorialIconButton(
+        systemImage: String,
+        help: String,
+        isDestructive: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(isDestructive ? .red.opacity(0.85) : DS.Colors.textPrimary)
+                .frame(width: 26, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+        .help(help)
     }
 
     /// Lets the user choose where the tutorial swap surface renders:
@@ -1315,8 +1360,10 @@ struct CompanionPanelView: View {
     }
 
     /// The card shown in place of the embed during the .instruction
-    /// phase. Big, readable text — the user just watched a chunk of
-    /// the tutorial and now has a few seconds to do it on their app.
+    /// phase. Shows the raw transcript text instantly; if Gemini's
+    /// `/tutorial-chunk` response lands within the swap window, the
+    /// text upgrades to a tight imperative ("Click File → New") and
+    /// the cursor flies to the named element on the user's app.
     private var tutorialInstructionCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
@@ -1327,6 +1374,12 @@ struct CompanionPanelView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(DS.Colors.textSecondary)
                 Spacer()
+                if companionManager.isTutorialInstructionLoading {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(0.45)
+                        .frame(width: 12, height: 12)
+                }
             }
 
             Text(companionManager.tutorialInstructionText)

@@ -309,6 +309,12 @@ struct BlueCursorView: View {
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundColor(.white.opacity(0.85))
                             Spacer()
+                            if companionManager.isTutorialInstructionLoading {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .scaleEffect(0.4)
+                                    .frame(width: 10, height: 10)
+                            }
                         }
                         Text(companionManager.tutorialInstructionText)
                             .font(.system(size: 11, weight: .medium))

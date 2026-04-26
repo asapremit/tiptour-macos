@@ -131,6 +131,17 @@ final class CompanionManager: ObservableObject {
     /// when we swap to .instruction.
     private var tutorialChunkStartSeconds: Double = 0
 
+    /// True when the user clicked Pause — both the swap loop AND the
+    /// embed are paused, and stay paused until they click Play again.
+    /// Different from tutorialDisplayPhase: the phase tells you which
+    /// surface is visible, this tells you whether time is advancing.
+    @Published private(set) var isTutorialPaused: Bool = false
+
+    /// True while we're awaiting the /tutorial-chunk worker response.
+    /// Drives the "..." spinner inside the instruction card so the
+    /// user knows the cleaned-up step is on the way.
+    @Published private(set) var isTutorialInstructionLoading: Bool = false
+
     /// Start a YouTube follow-along tutorial from a pasted URL. The
     /// minimal pipeline is: extract the video ID, mount a fresh
     /// `YouTubeEmbedController`, and pop open the menu bar panel so
@@ -203,6 +214,8 @@ final class CompanionManager: ObservableObject {
         tutorialInstructionText = ""
         tutorialTranscriptSegments = []
         tutorialChunkStartSeconds = 0
+        isTutorialPaused = false
+        isTutorialInstructionLoading = false
         removeTutorialHotkeyMonitor()
     }
 
@@ -250,13 +263,20 @@ final class CompanionManager: ObservableObject {
     /// Pause the embed, derive the instruction text from the chunk
     /// that just played, and flip the display phase. Animation is
     /// handled by SwiftUI's `withAnimation` on the published flag.
+    ///
+    /// Two-stage display so the user never sees a blank card while
+    /// Gemini is thinking:
+    ///   1. Immediately show the raw transcript text (snappy).
+    ///   2. In parallel, send the chunk + a fresh screenshot of the
+    ///      user's frontmost app to the worker's /tutorial-chunk
+    ///      route. When the response lands, replace the text with
+    ///      Gemini's tight imperative ("Click File → New") and fly
+    ///      the cursor to elementLabel via ElementResolver.
     private func swapVideoToInstruction(chunkStart: Double, chunkEnd: Double) {
         guard isTutorialActive else { return }
         tutorialEmbedController?.pause()
 
         // Slice the cached transcript for [chunkStart, chunkEnd].
-        // Joined with single spaces — punctuation comes from the
-        // transcript itself.
         let startWindow = max(0, chunkStart - 0.5)
         let endWindow = chunkEnd + 0.5
         let chunkText = tutorialTranscriptSegments
@@ -265,9 +285,8 @@ final class CompanionManager: ObservableObject {
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // Stage 1: instant raw text so the card has SOMETHING to show.
         if chunkText.isEmpty {
-            // No transcript text for this slice — show a quiet prompt
-            // instead of an empty rectangle.
             tutorialInstructionText = "Try what was just shown on your screen."
         } else {
             tutorialInstructionText = chunkText
@@ -277,6 +296,138 @@ final class CompanionManager: ObservableObject {
             tutorialDisplayPhase = .instruction
         }
         scheduleNextTutorialSwap(after: tutorialInstructionDurationSeconds)
+
+        // Stage 2: ask Gemini to clean up the transcript into a tight
+        // imperative + identify a screen element to point at. Don't
+        // block the swap on this; let it land asynchronously.
+        guard !chunkText.isEmpty else { return }
+        Task { [weak self, chunkText] in
+            await self?.processChunkInstruction(rawTranscriptChunk: chunkText)
+        }
+    }
+
+    /// Hit the worker's /tutorial-chunk route with the just-played
+    /// transcript + a screenshot of the user's frontmost app. When
+    /// the response lands (assuming we're still in .instruction phase
+    /// for THIS chunk), replace the instruction text and fly the
+    /// cursor to the suggested element. Best-effort — failures fall
+    /// back to the raw transcript text already displayed.
+    private func processChunkInstruction(rawTranscriptChunk: String) async {
+        await MainActor.run { self.isTutorialInstructionLoading = true }
+        defer { Task { @MainActor in self.isTutorialInstructionLoading = false } }
+
+        // Capture the user's actual screen so Gemini can identify
+        // visible elements to point at. Best-effort.
+        let screenshotBase64: String? = await {
+            guard let captures = try? await CompanionScreenCaptureUtility.captureAllScreensAsJPEG(),
+                  let first = captures.first(where: { $0.isCursorScreen }) ?? captures.first else {
+                return nil
+            }
+            return first.imageData.base64EncodedString()
+        }()
+
+        guard let url = URL(string: "\(Self.workerBaseURL)/tutorial-chunk") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.timeoutInterval = 12
+
+        var body: [String: Any] = ["transcriptChunk": rawTranscriptChunk]
+        if let screenshotBase64 = screenshotBase64 {
+            body["screenshotBase64"] = screenshotBase64
+        }
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return }
+        request.httpBody = payload
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                print("[Tutorial] /tutorial-chunk returned \(http.statusCode)")
+                return
+            }
+            // Gemini wraps responseSchema output inside its candidates envelope.
+            guard let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let candidates = envelope["candidates"] as? [[String: Any]],
+                  let content = candidates.first?["content"] as? [String: Any],
+                  let parts = content["parts"] as? [[String: Any]],
+                  let innerText = parts.first?["text"] as? String,
+                  let innerData = innerText.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: innerData) as? [String: Any],
+                  let instruction = parsed["instruction"] as? String else {
+                print("[Tutorial] /tutorial-chunk: couldn't parse response")
+                return
+            }
+            let elementLabel = parsed["elementLabel"] as? String
+
+            await MainActor.run {
+                // Only apply if we're still in the .instruction phase
+                // — if the user already advanced to the next chunk
+                // we'd otherwise overwrite their current text.
+                guard self.isTutorialActive,
+                      self.tutorialDisplayPhase == .instruction else { return }
+                self.tutorialInstructionText = instruction
+
+                // Point the cursor at the element if Gemini gave us a
+                // confident label. Reuses the same resolution cascade
+                // (AX → YOLO → semantic fallback) the voice-mode
+                // point_at_element handler uses.
+                if let elementLabel = elementLabel,
+                   !elementLabel.trimmingCharacters(in: .whitespaces).isEmpty {
+                    self.pointTutorialCursorAt(label: elementLabel)
+                }
+            }
+        } catch {
+            print("[Tutorial] /tutorial-chunk failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Resolve `label` against the user's frontmost app and fly the
+    /// cursor there. Same pipeline used by voice mode's
+    /// point_at_element tool — AX tree first, YOLO next, raw LLM
+    /// coords as last resort. Quiet on failure (just prints).
+    private func pointTutorialCursorAt(label: String) {
+        Task { [weak self] in
+            guard let self = self else { return }
+            let resolution = await ElementResolver.shared.resolve(
+                label: label,
+                llmHintInScreenshotPixels: nil,
+                latestCapture: nil
+            )
+            guard let resolution = resolution else {
+                print("[Tutorial] couldn't resolve \"\(label)\"")
+                return
+            }
+            print("[Tutorial] ✓ pointing at \"\(label)\" via \(resolution.source)")
+            await MainActor.run {
+                self.pointAtResolution(resolution)
+            }
+        }
+    }
+
+    // MARK: - Pause / resume
+
+    /// Toggle the pause state. When pausing: invalidate the swap
+    /// timer and pause the embed. When resuming: restart the swap
+    /// timer for the appropriate phase and resume embed playback.
+    func toggleTutorialPause() {
+        guard isTutorialActive else { return }
+        if isTutorialPaused {
+            isTutorialPaused = false
+            // Resume from current phase: if we're in .video, restart
+            // the chunk timer; if .instruction, restart the
+            // instruction timer.
+            if tutorialDisplayPhase == .video {
+                tutorialEmbedController?.play()
+                scheduleNextTutorialSwap(after: tutorialVideoChunkDurationSeconds)
+            } else {
+                scheduleNextTutorialSwap(after: tutorialInstructionDurationSeconds)
+            }
+        } else {
+            isTutorialPaused = true
+            tutorialSwapTimer?.invalidate()
+            tutorialSwapTimer = nil
+            tutorialEmbedController?.pause()
+        }
     }
 
     /// Resume the embed and flip back to the video phase. Capture the
