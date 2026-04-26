@@ -4,15 +4,15 @@ import { YoutubeTranscript } from "youtube-transcript";
  * TipTour Proxy Worker
  *
  * Thin Cloudflare Worker that proxies the Gemini API calls and the
- * YouTube-transcript → Gemini guide-generation pipeline, so the app
- * ships without raw API keys. Keys are stored as Cloudflare secrets.
+ * YouTube transcript fetcher, so the app ships without raw API keys.
+ * Keys are stored as Cloudflare secrets.
  *
  * Routes:
  *   GET  /gemini-live-key  → returns the Gemini API key so the app can
  *                            open a direct WebSocket to Gemini Live.
- *   POST /generate-guide   → Gemini 2.5 Flash for turning a YouTube
- *                            transcript into a structured tutorial guide.
  *   POST /transcript       → Fetches a YouTube transcript by video ID.
+ *   POST /match-label      → Multilingual label matcher used by the
+ *                            in-app ElementResolver fallback.
  */
 
 interface Env {
@@ -35,10 +35,6 @@ export default {
     }
 
     try {
-      if (url.pathname === "/generate-guide") {
-        return await handleGenerateGuide(request, env);
-      }
-
       if (url.pathname === "/transcript") {
         return await handleTranscript(request);
       }
@@ -83,37 +79,6 @@ async function handleTranscript(request: Request): Promise<Response> {
       headers: { "content-type": "application/json" },
     });
   }
-}
-
-async function handleGenerateGuide(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as { transcript: string };
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: body.transcript }] }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 65536 },
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`[/generate-guide] Gemini error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, {
-      status: response.status,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  const data = await response.text();
-  return new Response(data, {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
 }
 
 /**

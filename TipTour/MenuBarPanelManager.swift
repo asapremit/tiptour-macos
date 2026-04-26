@@ -262,8 +262,7 @@ final class MenuBarPanelManager: NSObject {
         // Same idea while a tutorial is running — the user must be
         // able to click around in their app to follow along, and the
         // embedded video should stay visible the whole time.
-        if companionManager.isTutorialActive
-            && companionManager.tutorialVideoMode == .menuBar {
+        if companionManager.isTutorialActive {
             return
         }
 
