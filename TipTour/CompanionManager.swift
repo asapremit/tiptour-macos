@@ -766,7 +766,7 @@ final class CompanionManager: ObservableObject {
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
     private static let workerBaseURL: String = {
-        let url = "http://localhost:8787"
+        let url = "https://clicky-proxy.milindsoni201.workers.dev"
         // ElementResolver's multilingual /match-label fallback hits the
         // same worker. Setting the override here means we have one
         // source of truth for the base URL.

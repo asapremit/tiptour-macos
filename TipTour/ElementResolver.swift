@@ -426,7 +426,7 @@ final class ElementResolver: @unchecked Sendable {
     nonisolated(unsafe) static var workerBaseURLOverride: String?
     /// Fallback if no override has been set yet (very early calls).
     /// Matches CompanionManager.workerBaseURL by convention.
-    private static let defaultWorkerBaseURL: String? = "http://localhost:8787"
+    private static let defaultWorkerBaseURL: String? = "https://clicky-proxy.milindsoni201.workers.dev"
 
     // MARK: - Coordinate Conversion
 
