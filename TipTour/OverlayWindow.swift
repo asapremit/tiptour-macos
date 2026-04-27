@@ -282,70 +282,6 @@ struct BlueCursorView: View {
                 )
             }
 
-            // Tutorial swap surface (cursor-following mode). Same
-            // ZStack pattern as the menu bar embed: YouTubeEmbedView
-            // and instruction card layered, cross-fading on
-            // tutorialDisplayPhase. The chip is anchored to the right
-            // of the cursor position and is hit-testable so YouTube's
-            // controls remain usable. Only renders when
-            // tutorialVideoMode == .cursorFollowing.
-            if companionManager.isTutorialActive,
-               companionManager.tutorialVideoMode == .cursorFollowing,
-               isCursorOnThisScreen,
-               let embedController = companionManager.tutorialEmbedController,
-               let videoID = companionManager.activeTutorialVideoID {
-                ZStack {
-                    YouTubeEmbedView(videoID: videoID, controller: embedController)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .opacity(companionManager.tutorialDisplayPhase == .video ? 1 : 0)
-                        .allowsHitTesting(companionManager.tutorialDisplayPhase == .video)
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 5) {
-                            Image(systemName: "hand.point.up.left.fill")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(DS.Colors.overlayCursorBlue)
-                            Text("Your turn")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.85))
-                            Spacer()
-                            if companionManager.isTutorialInstructionLoading {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                                    .scaleEffect(0.4)
-                                    .frame(width: 10, height: 10)
-                            }
-                        }
-                        Text(companionManager.tutorialInstructionText)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white)
-                            .multilineTextAlignment(.leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .lineLimit(6)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color.black.opacity(0.78))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(DS.Colors.overlayCursorBlue.opacity(0.45), lineWidth: 1)
-                    )
-                    .opacity(companionManager.tutorialDisplayPhase == .instruction ? 1 : 0)
-                }
-                .frame(width: 360, height: 200)  // 16:9-ish, comfortable reading size
-                .shadow(color: Color.black.opacity(0.5), radius: 14, x: 0, y: 8)
-                .position(
-                    x: cursorPosition.x + 28 + 180,
-                    y: cursorPosition.y + 24 + 100
-                )
-                .animation(.spring(response: 0.25, dampingFraction: 0.7, blendDuration: 0), value: cursorPosition)
-                .animation(.easeInOut(duration: 0.4), value: companionManager.tutorialDisplayPhase)
-            }
-
             // Navigation pointer bubble — shown when buddy arrives at a detected element.
             // Pops in with a scale-bounce (0.5x → 1.0x spring) and a bright initial
             // glow that settles, creating a "materializing" effect.
@@ -417,12 +353,7 @@ struct BlueCursorView: View {
             if companionManager.isNekoModeEnabled {
                 NekoCursorView(
                     position: cursorPosition,
-                    opacity: {
-                        if !buddyIsVisibleOnThisScreen { return 0 }
-                        if companionManager.voiceMode == .geminiLive { return cursorOpacity }
-                        if companionManager.voiceState != .idle && companionManager.voiceState != .responding { return 0 }
-                        return cursorOpacity
-                    }(),
+                    opacity: buddyIsVisibleOnThisScreen ? cursorOpacity : 0,
                     flightScale: buddyFlightScale
                 )
                 .animation(
@@ -440,12 +371,7 @@ struct BlueCursorView: View {
                     .rotationEffect(.degrees(triangleRotationDegrees))
                     .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
                     .scaleEffect(buddyFlightScale)
-                    .opacity({
-                        if !buddyIsVisibleOnThisScreen { return 0 }
-                        if companionManager.voiceMode == .geminiLive { return cursorOpacity }
-                        if companionManager.voiceState != .idle && companionManager.voiceState != .responding { return 0 }
-                        return cursorOpacity
-                    }())
+                    .opacity(buddyIsVisibleOnThisScreen ? cursorOpacity : 0)
                     .scaleEffect(buddyFlightScale)
                     .position(cursorPosition)
                     .animation(
@@ -461,32 +387,22 @@ struct BlueCursorView: View {
                     )
             }
 
-            // Blue waveform. In Claude mode it replaces the triangle while listening.
-            // In Gemini Live mode it floats next to the triangle and stays visible
-            // through both listening and responding states — UNLESS a pointing
-            // label bubble is showing, in which case we hide the waveform so it
-            // doesn't overlap the label.
+            // Blue waveform — floats next to the cursor and stays visible
+            // through both listening and responding states, unless a pointing
+            // label bubble is showing (in which case we hide it so it doesn't
+            // overlap the label).
             let waveformIsVisible: Bool = {
                 guard buddyIsVisibleOnThisScreen else { return false }
-                // Hide while pointing at an element — label bubble takes that space
                 if companionManager.detectedElementScreenLocation != nil {
                     return false
                 }
-                if companionManager.voiceMode == .geminiLive {
-                    return companionManager.voiceState == .listening
-                        || companionManager.voiceState == .responding
-                }
                 return companionManager.voiceState == .listening
+                    || companionManager.voiceState == .responding
             }()
 
-            let waveformPosition: CGPoint = {
-                if companionManager.voiceMode == .geminiLive {
-                    // Offset to the right and down from the arrow tip so both
-                    // elements are clearly visible at once.
-                    return CGPoint(x: cursorPosition.x + 22, y: cursorPosition.y + 16)
-                }
-                return cursorPosition
-            }()
+            // Offset to the right and down from the arrow tip so both
+            // elements are clearly visible at once.
+            let waveformPosition = CGPoint(x: cursorPosition.x + 22, y: cursorPosition.y + 16)
 
             BlueCursorWaveformView(audioPowerLevel: companionManager.currentAudioPowerLevel)
                 .opacity(waveformIsVisible ? cursorOpacity : 0)

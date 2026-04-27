@@ -2,7 +2,7 @@
 //  WorkflowPlan.swift
 //  TipTour
 //
-//  Schema for AI-generated interactive tutorials. The LLM emits a
+//  Schema for AI-generated multi-step walkthroughs. Gemini emits a
 //  structured plan (JSON) describing a multi-step workflow — we
 //  resolve and execute the steps one at a time.
 //

@@ -13,7 +13,7 @@ import CoreGraphics
 import Foundation
 
 final class GlobalPushToTalkShortcutMonitor: ObservableObject {
-    let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    let shortcutTransitionPublisher = PassthroughSubject<PushToTalkShortcut.ShortcutTransition, Never>()
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
@@ -109,7 +109,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         }
 
         let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-        let shortcutTransition = BuddyPushToTalkShortcut.shortcutTransition(
+        let shortcutTransition = PushToTalkShortcut.shortcutTransition(
             for: eventType,
             keyCode: eventKeyCode,
             modifierFlagsRawValue: event.flags.rawValue,

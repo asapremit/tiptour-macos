@@ -1,16 +1,13 @@
-import { YoutubeTranscript } from "youtube-transcript";
-
 /**
  * TipTour Proxy Worker
  *
- * Thin Cloudflare Worker that proxies the Gemini API calls and the
- * YouTube transcript fetcher, so the app ships without raw API keys.
+ * Thin Cloudflare Worker that exposes the Gemini API key for direct
+ * WebSocket connections and provides a multilingual label matcher.
  * Keys are stored as Cloudflare secrets.
  *
  * Routes:
  *   GET  /gemini-live-key  → returns the Gemini API key so the app can
  *                            open a direct WebSocket to Gemini Live.
- *   POST /transcript       → Fetches a YouTube transcript by video ID.
  *   POST /match-label      → Multilingual label matcher used by the
  *                            in-app ElementResolver fallback.
  */
@@ -35,16 +32,8 @@ export default {
     }
 
     try {
-      if (url.pathname === "/transcript") {
-        return await handleTranscript(request);
-      }
-
       if (url.pathname === "/match-label") {
         return await handleMatchLabel(request, env);
-      }
-
-      if (url.pathname === "/tutorial-chunk") {
-        return await handleTutorialChunk(request, env);
       }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
@@ -57,33 +46,6 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
-
-async function handleTranscript(request: Request): Promise<Response> {
-  const { videoID } = await request.json() as { videoID: string };
-
-  try {
-    const segments = await YoutubeTranscript.fetchTranscript(videoID);
-
-    // Format as timestamped lines
-    const transcript = segments.map((s: any) => {
-      const mins = Math.floor(s.offset / 60000);
-      const secs = Math.floor((s.offset % 60000) / 1000);
-      return `[${mins}:${secs.toString().padStart(2, "0")}] ${s.text}`;
-    }).join("\n");
-
-    console.log(`[/transcript] Got ${segments.length} segments, ${transcript.length} chars`);
-
-    return new Response(JSON.stringify({ transcript }), {
-      headers: { "content-type": "application/json" },
-    });
-  } catch (e) {
-    console.error("[/transcript] Failed:", e);
-    return new Response(JSON.stringify({ error: String(e) }), {
-      status: 404,
-      headers: { "content-type": "application/json" },
-    });
-  }
-}
 
 /**
  * /match-label
@@ -151,165 +113,6 @@ async function handleMatchLabel(request: Request, env: Env): Promise<Response> {
     console.error(`[/match-label] Gemini error ${response.status}: ${errorBody}`);
     return new Response(JSON.stringify({ match: null }), {
       status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  const data = await response.text();
-  return new Response(data, {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-/**
- * /tutorial-chunk
- *
- * Body: { transcriptChunk: string, screenshotBase64?: string }
- *
- * Called from the app every time the tutorial swaps from .video to
- * .instruction. Takes the raw transcript text from the 10-second
- * segment that just played plus an optional screenshot of the user's
- * actual screen, and returns:
- *   - a tight 1-2 sentence imperative instruction ("Click File → New")
- *   - optionally an `elementLabel` the app should fly the cursor to
- *     (must be visible text from the user's screenshot)
- *
- * Uses gemini-2.5-flash with structured output so the response is
- * always parseable JSON. ~1-3s typical latency.
- */
-async function handleTutorialChunk(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as {
-    transcriptChunk: string;
-    screenshotBase64?: string;
-    /// When true, the user is in a browser. Browser AX trees are
-    /// flattened (Chrome, Arc, Edge, Firefox) so labels won't
-    /// resolve via macOS Accessibility. Switch to pixel-coordinate
-    /// pointing instead — Gemini returns the (x, y) of the target
-    /// element in the screenshot's pixel space and the app converts
-    /// to screen coords directly.
-    isBrowser?: boolean;
-    /// Width and height of the screenshot in pixels. Required when
-    /// isBrowser=true so the model knows the coordinate space its
-    /// (x, y) reply is in.
-    screenshotWidthPx?: number;
-    screenshotHeightPx?: number;
-  };
-
-  const sharedRules = `
-Translate the narrator's words into a tight, imperative
-instruction the user can act on right now.
-
-Rules:
-- 1-2 SHORT sentences max. Direct imperative voice ("Click File → New").
-- NO filler ("Now you can...", "What we want to do is...", "Let's...").
-- Reference specific menus / buttons / fields by name.
-- Use → to chain steps ("Click File → New → Project").
-- If the segment is mid-explanation with no clear action, return a
-  one-line summary of what the narrator just covered.
-`.trim();
-
-  // Two completely different system prompts depending on whether
-  // the user is in a native macOS app (label-based pointing works)
-  // or a browser (label-based pointing fails — pixel coords only).
-  const systemInstruction = body.isBrowser
-    ? `
-You are watching the user follow a YouTube software tutorial in a
-WEB BROWSER. The video just played a short segment with this
-transcript and a screenshot of the user's actual browser tab.
-
-${sharedRules}
-
-The user is in a browser, so element labels alone CANNOT be
-resolved (browser DOMs aren't exposed to macOS accessibility
-trees). Instead, you must return SCREEN PIXEL COORDINATES of the
-target element directly from the screenshot.
-
-The screenshot is ${body.screenshotWidthPx ?? "?"} pixels wide by
-${body.screenshotHeightPx ?? "?"} pixels tall. Origin is the
-TOP-LEFT corner. Pick the (x, y) at the center of the element
-the user should interact with.
-
-If the segment doesn't have a clear element to point at, return
-null for screenCoordinates.
-
-Return STRICT JSON only, no markdown:
-  { "instruction": "<imperative sentence>", "screenCoordinates": [x, y] or null }
-`.trim()
-    : `
-You are watching the user follow a YouTube software tutorial. The
-video just played a short segment with this transcript. The
-attached screenshot is the user's actual native macOS app.
-
-${sharedRules}
-
-If you can identify a SPECIFIC visible UI element on the user's
-screenshot that they should click for this step, also return the
-element's exact visible label as elementLabel. The label must be
-text the user can SEE on their screen RIGHT NOW. If you can't be
-confident, return null.
-
-Return STRICT JSON only, no markdown:
-  { "instruction": "<imperative sentence>", "elementLabel": "<exact label>" or null }
-`.trim();
-
-  // The schema validation also branches: browser path gets
-  // screenCoordinates, native gets elementLabel.
-  const responseSchema = body.isBrowser
-    ? {
-        type: "object",
-        properties: {
-          instruction: { type: "string" },
-          screenCoordinates: {
-            type: "array",
-            items: { type: "number" },
-            minItems: 2,
-            maxItems: 2,
-          },
-        },
-        required: ["instruction"],
-      }
-    : {
-        type: "object",
-        properties: {
-          instruction: { type: "string" },
-          elementLabel: { type: "string" },
-        },
-        required: ["instruction"],
-      };
-
-  const contentParts: any[] = [
-    { text: `Transcript of the segment that just played:\n"${body.transcriptChunk}"` },
-  ];
-  if (body.screenshotBase64) {
-    contentParts.push({
-      inlineData: { mimeType: "image/jpeg", data: body.screenshotBase64 },
-    });
-  }
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents: [{ parts: contentParts }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 256,
-          responseMimeType: "application/json",
-          responseSchema,
-        },
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`[/tutorial-chunk] Gemini error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, {
-      status: response.status,
       headers: { "content-type": "application/json" },
     });
   }

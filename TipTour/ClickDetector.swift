@@ -4,7 +4,7 @@
 //
 //  Listens for global left-mouse-down events and fires a callback if
 //  the click lands inside (or within a small tolerance of) the currently
-//  armed target. Used by WorkflowRunner to auto-advance the tutorial
+//  armed target. Used by WorkflowRunner to auto-advance the workflow
 //  checklist when the user clicks the element the cursor is pointing at.
 //
 //  Deliberately minimal:
@@ -195,8 +195,9 @@ final class ClickDetector {
         let shouldFireDueToDebugBypass = Self.advanceOnAnyClickEnabled
         let shouldFire = isWithinRect || isWithinPointRadius || shouldFireDueToDebugBypass
 
-        let debugSuffix = shouldFireDueToDebugBypass && !isWithinRect && !isWithinPointRadius
-            ? " [debug: advancing anyway]"
+        let isDebugBypassMiss = shouldFireDueToDebugBypass && !isWithinRect && !isWithinPointRadius
+        let debugSuffix = isDebugBypassMiss
+            ? " [debug: advancing anyway — cursor was off by \(Int(distanceFromPoint))pt, indicates a resolution accuracy issue]"
             : ""
         print("[ClickDetector] click at \(clickPointInGlobalScreenCoordinates) — rectHit=\(isWithinRect) pointHit=\(isWithinPointRadius) dist=\(Int(distanceFromPoint))pt\(debugSuffix)")
 
