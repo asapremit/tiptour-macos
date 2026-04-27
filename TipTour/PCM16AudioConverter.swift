@@ -1,8 +1,10 @@
 //
-//  BuddyAudioConversionSupport.swift
+//  PCM16AudioConverter.swift
 //  TipTour
 //
-//  Shared audio conversion helpers for voice transcription providers.
+//  Converts AVAudioPCMBuffers (whatever the mic produces) into PCM16 mono
+//  Data at a target sample rate. Used by GeminiLiveSession to feed the
+//  Gemini Live WebSocket, which expects 16kHz mono PCM16.
 //
 
 import AVFoundation
@@ -66,43 +68,5 @@ final class BuddyPCM16AudioConverter {
         guard byteCount > 0 else { return nil }
 
         return Data(bytes: pcmDataPointer, count: byteCount)
-    }
-}
-
-enum BuddyWAVFileBuilder {
-    static func buildWAVData(
-        fromPCM16MonoAudio pcm16AudioData: Data,
-        sampleRate: Int,
-        channelCount: Int = 1,
-        bitsPerSample: Int = 16
-    ) -> Data {
-        let byteRate = sampleRate * channelCount * bitsPerSample / 8
-        let blockAlign = channelCount * bitsPerSample / 8
-        let dataChunkSize = UInt32(pcm16AudioData.count)
-        let fileSize = UInt32(36) + dataChunkSize
-
-        var wavData = Data()
-
-        wavData.append("RIFF".data(using: .ascii)!)
-        wavData.append(littleEndianData(from: fileSize))
-        wavData.append("WAVE".data(using: .ascii)!)
-        wavData.append("fmt ".data(using: .ascii)!)
-        wavData.append(littleEndianData(from: UInt32(16)))
-        wavData.append(littleEndianData(from: UInt16(1)))
-        wavData.append(littleEndianData(from: UInt16(channelCount)))
-        wavData.append(littleEndianData(from: UInt32(sampleRate)))
-        wavData.append(littleEndianData(from: UInt32(byteRate)))
-        wavData.append(littleEndianData(from: UInt16(blockAlign)))
-        wavData.append(littleEndianData(from: UInt16(bitsPerSample)))
-        wavData.append("data".data(using: .ascii)!)
-        wavData.append(littleEndianData(from: dataChunkSize))
-        wavData.append(pcm16AudioData)
-
-        return wavData
-    }
-
-    private static func littleEndianData<T: FixedWidthInteger>(from value: T) -> Data {
-        var littleEndianValue = value.littleEndian
-        return Data(bytes: &littleEndianValue, count: MemoryLayout<T>.size)
     }
 }

@@ -5,27 +5,27 @@
 
 ## Overview
 
-macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to capture voice input, transcribes it via AssemblyAI streaming, and sends the transcript + a screenshot of the user's screen to Claude. Claude responds with text (streamed via SSE) and voice (ElevenLabs TTS). A blue cursor overlay can fly to and point at UI elements Claude references on any connected monitor.
+macOS menu bar voice companion. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel. Push-to-talk (Ctrl+Option) opens a Gemini Live realtime session — Gemini hears the user, sees the user's screen via streaming JPEG screenshots, replies in voice, and calls tools to fly a blue cursor at on-screen elements or run a multi-step walkthrough.
 
 All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in the app.
 
 ## Architecture
 
-- **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
-- **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
-- **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **Voice Mode**: Gemini Live only. Single-model realtime WebSocket to `gemini-3.1-flash-live-preview` — bidirectional voice (PCM16 16kHz in, PCM16 24kHz out), vision (JPEG screenshots), text transcription, AND tool calling all in one streaming connection. Two tools exposed: `point_at_element(label)` for single-click asks, `submit_workflow_plan(goal, app, steps)` for multi-step walkthroughs. Gemini produces workflow plans itself inside its tool call — no separate planner model. API key fetched from Worker's `/gemini-live-key` endpoint.
-- **Legacy voice code** (Apple Speech STT → Claude → ElevenLabs) remains compiled but has no user-visible UI to select it. The code paths are candidate for deletion in a future cleanup.
-- **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
-- **Voice Input**: Gemini Live mode streams mic audio directly over the WebSocket. Hotkey is a listen-only CGEvent tap so modifier-only shortcuts (ctrl+opt) work reliably in background.
+- **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window.
+- **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay.
+- **Pattern**: MVVM with `@StateObject` / `@Published` state management.
+- **Voice Mode**: Gemini Live only. Single-model realtime WebSocket — bidirectional voice (PCM16 16kHz in, PCM16 24kHz out), vision (JPEG screenshots), text transcription, AND tool calling all in one streaming connection. Two tools exposed: `point_at_element(label)` for single-click asks, `submit_workflow_plan(goal, app, steps)` for multi-step walkthroughs. Gemini produces workflow plans itself inside its tool call — no separate planner model. API key fetched from Worker's `/gemini-live-key` endpoint.
+- **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support.
+- **Voice Input**: GeminiLiveSession captures mic audio and streams it directly over the WebSocket. Hotkey is a listen-only CGEvent tap so modifier-only shortcuts (Ctrl+Option) work reliably in the background.
 - **Element Pointing**: The LLM calls one of two tools. `ElementResolver` resolves the `label` argument to pixel positions via a three-tier lookup:
     1. **macOS Accessibility tree** — pixel-perfect, ~30ms. Works on native Mac apps, most Electron apps, and anywhere a well-formed AX tree is exposed.
-    2. **YOLO + OCR visual detection** — fallback for apps without good AX support (Blender, games, some web content). Uses step 1's optional `x,y` hint as proximity anchor.
+    2. **YOLO + OCR visual detection** — fallback for apps without good AX support (Blender, games, some web content). Uses the optional `x,y` hint as a proximity anchor.
     3. **Raw LLM coordinates** — absolute last resort.
 - **Element Detection**: On-device via `NativeElementDetector.swift` — CoreML YOLO model (`UIElementDetector.mlpackage`) for UI element bounding boxes + Apple Vision framework (`VNRecognizeTextRequest`, accurate mode) for OCR text detection. No external server, no Python, no OmniParser dependency.
 - **Accessibility Tree**: `AccessibilityTreeResolver.swift` walks the user's target app's AX tree via `ApplicationServices`, matches elements by title/description/value, returns exact pixel frames in global AppKit coordinates. Uses a snapshot of `NSWorkspace.frontmostApplication` taken at hotkey press time so the query targets the app the user was actually looking at, not TipTour's own menu bar.
-- **Concurrency**: `@MainActor` isolation, async/await throughout
-- **Analytics**: PostHog via `TipTourAnalytics.swift`
+- **Multi-step walkthroughs**: `WorkflowRunner` consumes plans emitted by Gemini's `submit_workflow_plan` tool, drives the cursor step-by-step, and uses `ClickDetector` (a global listen-only CGEventTap) to auto-advance when the user clicks the resolved target.
+- **Concurrency**: `@MainActor` isolation, async/await throughout.
+- **Analytics**: PostHog via `TipTourAnalytics.swift`.
 
 ### API Proxy (Cloudflare Worker)
 
@@ -34,12 +34,9 @@ The app never calls external APIs directly. All requests go through a Cloudflare
 | Route | Upstream | Purpose |
 |-------|----------|---------|
 | `GET /gemini-live-key` | — (returns secret) | Returns the Gemini API key so the app can open a direct WebSocket to Gemini Live. Cloudflare Workers can't proxy Gemini's WebSocket so we expose the key to trusted clients. |
-| `POST /generate-guide` | `generativelanguage.googleapis.com/.../gemini-2.5-flash` | Gemini guide generation from YouTube transcripts |
-| `POST /transcript` | `youtube-transcript` (npm package) | Fetches YouTube video transcripts |
+| `POST /match-label` | `gemini-2.5-flash-lite` | Multilingual label matcher used by `ElementResolver`'s fallback when the LLM passes a label in one language and the AX tree has it in another. |
 
-Worker secret: `GEMINI_API_KEY`
-
-Removed previously: `/chat` + `ANTHROPIC_API_KEY` + `ELEVENLABS_API_KEY` + `/tts` + `/chat-fast` + `OPENROUTER_API_KEY` + `ELEVENLABS_VOICE_ID` (Gemini-only shipping default, the Claude + ElevenLabs + OpenRouter legacy pipelines are no longer reachable from the UI); `/plan` (Gemini now plans inside its own tool call); `/transcribe-token` + `ASSEMBLYAI_API_KEY` (Gemini Live does STT in-stream).
+Worker secret: `GEMINI_API_KEY`.
 
 ### Key Architecture Decisions
 
@@ -47,42 +44,43 @@ Removed previously: `/chat` + `ANTHROPIC_API_KEY` + `ELEVENLABS_API_KEY` + `/tts
 
 **Cursor Overlay**: A full-screen transparent `NSPanel` hosts the blue cursor companion. It's non-activating, joins all Spaces, and never steals focus. The cursor position, response text, waveform, and pointing animations all render in this overlay via SwiftUI through `NSHostingView`.
 
-**Global Push-To-Talk Shortcut**: Background push-to-talk uses a listen-only `CGEvent` tap instead of an AppKit global monitor so modifier-based shortcuts like `ctrl + option` are detected more reliably while the app is running in the background.
+**Global Push-To-Talk Shortcut**: Background push-to-talk uses a listen-only `CGEvent` tap instead of an AppKit global monitor so modifier-based shortcuts like `Ctrl+Option` are detected more reliably while the app is running in the background.
 
-**Transient Cursor Mode**: When "Show TipTour" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity.
+**Toggle (not hold) push-to-talk**: Press Ctrl+Option once to open the Gemini Live session, press again to close it. The connection stays open between turns so the user can have a real conversation.
 
 ## Key Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `TipTourApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
-| `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
-| `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
+| `TipTourApp.swift` | ~106 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
+| `CompanionManager.swift` | ~927 | Central state machine. Owns the global hotkey, screen capture, Gemini Live session, tool handlers, permissions, and overlay management. |
+| `MenuBarPanelManager.swift` | ~265 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
+| `CompanionPanelView.swift` | ~981 | SwiftUI panel content. Status header, permissions setup, optional workflow checklist, neko mode toggle, developer section, footer. Dark aesthetic via `DS` design system. |
+| `OverlayWindow.swift` | ~960 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
-| `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
-| `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
-| `BuddyTranscriptionProvider.swift` | ~40 | Protocol surface. Always returns `AppleSpeechTranscriptionProvider` (only used by the legacy Claude voice mode; Gemini Live handles STT in-stream). |
-| `AppleSpeechTranscriptionProvider.swift` | ~147 | On-device transcription backed by Apple's Speech framework. Free, offline, no network key required. |
-| `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
+| `CompanionScreenCaptureUtility.swift` | ~187 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
 | `GlobalPushToTalkShortcutMonitor.swift` | ~132 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions. |
-| `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
-| `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
-| `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
-| `NativeElementDetector.swift` | ~270 | On-device element detection using CoreML YOLO + Apple Vision OCR. Maintains a live-fed cache for instant element lookups. Used as fallback when AX tree is unavailable. |
-| `AccessibilityTreeResolver.swift` | ~250 | Walks the frontmost app's macOS Accessibility tree, looks up elements by title/description/value, returns pixel-perfect frames. Primary element-lookup path — covers native Mac apps, SwiftUI, AppKit, most Electron. |
-| `ElementResolver.swift` | ~140 | Unified single-entry resolver. Given a label (and optional LLM coord hint), tries AX tree → YOLO+OCR → raw LLM coords in order. Always produces a global AppKit point so the overlay can fly the cursor directly. |
-| `GeminiLiveClient.swift` | ~280 | WebSocket client for Google's Gemini Live API. Sends PCM16 audio, JPEG screenshots, and text; receives PCM16 audio chunks and transcripts. All messages are JSON over a single wss:// connection. |
-| `GeminiLiveAudioPlayer.swift` | ~120 | Streaming PCM16 24kHz audio playback via AVAudioEngine + AVAudioPlayerNode. Queues incoming audio chunks from the WebSocket for gapless playback. |
-| `GeminiLiveSession.swift` | ~200 | Orchestrator that ties the WebSocket client + audio player + mic capture together. Owns the Gemini Live conversation lifecycle and exposes published state (input/output transcripts, isModelSpeaking) for the UI. |
+| `PushToTalkShortcut.swift` | ~40 | Encodes the single shortcut TipTour listens for (Ctrl+Option) and translates raw CGEvents into press/release transitions. |
+| `NativeElementDetector.swift` | ~624 | On-device element detection using CoreML YOLO + Apple Vision OCR. Maintains a live-fed cache for instant element lookups. Used as fallback when AX tree is unavailable. |
+| `AccessibilityTreeResolver.swift` | ~948 | Walks the frontmost app's macOS Accessibility tree, looks up elements by title/description/value, returns pixel-perfect frames. Primary element-lookup path. |
+| `ElementResolver.swift` | ~490 | Unified single-entry resolver. Given a label (and optional LLM coord hint), tries AX tree → YOLO+OCR → raw LLM coords in order. Always produces a global AppKit point so the overlay can fly the cursor directly. |
+| `GeminiLiveClient.swift` | ~634 | WebSocket client for Google's Gemini Live API. Sends PCM16 audio, JPEG screenshots, and text; receives PCM16 audio chunks and transcripts. All messages are JSON over a single wss:// connection. |
+| `GeminiLiveAudioPlayer.swift` | ~148 | Streaming PCM16 24kHz audio playback via AVAudioEngine + AVAudioPlayerNode. Queues incoming audio chunks from the WebSocket for gapless playback. |
+| `GeminiLiveSession.swift` | ~832 | Orchestrator that ties the WebSocket client + audio player + mic capture together. Owns the Gemini Live conversation lifecycle and exposes published state (input/output transcripts, isModelSpeaking) for the UI. |
+| `WorkflowPlan.swift` | ~184 | Schema for Gemini-emitted multi-step plans (goal, app, steps). |
+| `WorkflowRunner.swift` | ~376 | Executes Gemini-produced workflow plans. Resolves each step, arms the click detector, advances when the user clicks the resolved target. |
+| `ClickDetector.swift` | ~227 | Global listen-only CGEventTap that fires a callback when a left-mouse-down lands within a tolerance radius of an armed target. WorkflowRunner uses it to auto-advance the checklist. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
-| `ClickDetector.swift` | ~150 | Global listen-only CGEventTap that fires a callback when a left-mouse-down lands within a tolerance radius of an armed target. WorkflowRunner uses it to auto-advance the tutorial checklist when the user clicks the element the cursor is pointing at. |
+| `NekoCursorView.swift` | ~288 | Pixel-art cat cursor (oneko sprites). Whimsical visual replacement for the blue triangle — toggleable, defaults on. |
+| `DetectionOverlayView.swift` | ~102 | Debug visualization of YOLO detection boxes. |
+| `ScreenshotPerceptualHash.swift` | ~96 | dHash implementation. Deduplicates similar screenshots before sending to Gemini. |
+| `RetryWithExponentialBackoff.swift` | ~67 | Utility helper for retry logic. |
+| `KeychainStore.swift` | ~107 | macOS Keychain wrapper for storing the developer-pasted Gemini API key. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
-| `TipTourAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |
+| `TipTourAnalytics.swift` | ~106 | PostHog analytics integration for usage tracking. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
-| `worker/src/index.ts` | ~142 | Cloudflare Worker proxy. Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
+| `worker/src/index.ts` | ~140 | Cloudflare Worker proxy. Two routes: `/gemini-live-key` (Gemini Live API key) and `/match-label` (multilingual label matcher). |
 
 ## Build & Run
 

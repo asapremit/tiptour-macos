@@ -7,8 +7,5 @@
   },
   "devDependencies": {
     "wrangler": "^3.0.0"
-  },
-  "dependencies": {
-    "youtube-transcript": "^1.3.0"
   }
 }

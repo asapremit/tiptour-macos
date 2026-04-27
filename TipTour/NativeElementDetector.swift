@@ -261,22 +261,24 @@ class NativeElementDetector {
     /// clickable element the LLM was pointing at.
     ///
     /// The LLM gives approximately-right coordinates — often off by
-    /// 100-300 pixels in visually-complex apps like Blender because
-    /// the LLM reasons on a downscaled image internally. Our YOLO
-    /// detections are pixel-perfect, so we use the LLM's coord as a
-    /// proximity anchor and snap to the nearest clickable-looking
-    /// YOLO box.
+    /// 30-100 pixels in visually-complex apps like Blender because the
+    /// LLM reasons on a downscaled image internally. YOLO detections
+    /// are pixel-perfect, so we use the LLM's coord as a proximity
+    /// anchor and snap only when we're confident the snap is correct.
     ///
-    /// Strategy:
-    ///   1. If a YOLO box CONTAINS the hint, pick the smallest containing
-    ///      box (tightest fit around the click target).
-    ///   2. Otherwise pick the NEAREST YOLO box. No hard distance cap —
-    ///      if Gemini is off by 300px in Blender, we still want to snap.
-    ///      Label agreement with OCR-inside-box acts as a tiebreaker.
+    /// Why "confident" matters: in stacked submenus (Blender's Mesh
+    /// menu, context menus, dropdowns), adjacent items are ~25-30px
+    /// apart vertically. A loose proximity snap with a 60-100px hint
+    /// error will silently land on the wrong item. The previous
+    /// "snap to nearest within 400px" policy hid this kind of miss.
     ///
-    /// OCR garbage (common on 3D/code apps) doesn't hurt us — when OCR
-    /// can't read the screen, label scores are zero and we fall back to
-    /// pure proximity, which still beats using the raw LLM coordinate.
+    /// New strategy:
+    ///   1. Containing box → use it (smallest one, tightest fit).
+    ///   2. Box whose OCR text matches the query AND within 200px of
+    ///      hint → use closest such box (label-confirmed snap).
+    ///   3. Otherwise → return nil so the caller falls back to raw
+    ///      LLM coordinates. We'd rather use Gemini's pixel directly
+    ///      than risk snapping to a wrong sibling.
     func refineCoordinate(hint: CGPoint, label: String) -> FoundElement? {
         cacheLock.lock()
         let elements = cachedElements
@@ -302,58 +304,46 @@ class NativeElementDetector {
             )
         }
 
-        // 2. No box contains the hint — snap to the nearest one, with
-        //    label agreement as a tiebreaker among similarly-close boxes.
+        // 2. No containing box. Look for a box whose OCR text matches
+        //    the query AND is reasonably close to the hint. If found,
+        //    that's a high-confidence snap. If not, return nil so the
+        //    caller can fall back to raw LLM coordinates.
         let normalizedQuery = Self.normalizeQuery(label)
-        let scored = yoloBoxes.map { box -> (box: DetectedElement, score: Double, labelMatched: Bool) in
+        let labelMatchSearchRadius: CGFloat = 200
+
+        var labelMatchedBoxes: [(box: DetectedElement, distance: CGFloat)] = []
+        for box in yoloBoxes {
             let distance = hypot(box.center.x - hint.x, box.center.y - hint.y)
-            let proximityScore = 1.0 / (1.0 + Double(distance) / 250.0)
+            guard distance <= labelMatchSearchRadius else { continue }
 
             let boxLabels = ocrElements
                 .filter { box.bbox.intersects($0.bbox) || box.bbox.contains($0.center) }
                 .map { $0.label }
-            var labelScore = 0.0
             for boxLabel in boxLabels {
                 let normalizedLabel = Self.normalizeQuery(boxLabel)
                 let shared = normalizedLabel.words.intersection(normalizedQuery.words)
                 if !shared.isEmpty {
-                    let coverage = Double(shared.count) / Double(max(normalizedQuery.words.count, 1))
-                    labelScore = max(labelScore, coverage)
+                    labelMatchedBoxes.append((box, distance))
+                    break
                 }
             }
-            // Weight YOLO's own confidence into the ranking. Low-
-            // confidence detections (shadows, text artifacts, partial
-            // icons) are often false positives; a slightly-further
-            // 0.85-confidence box almost always beats a very-close
-            // 0.3-confidence one. Scales proximity by 0.5 + conf/2 so a
-            // 1.0-confidence box scores at full proximity weight and a
-            // 0.0-confidence one at half.
-            let confidenceFactor = 0.5 + box.confidence / 2.0
-            let combinedScore = proximityScore * confidenceFactor + (labelScore * 0.5)
-            return (box, combinedScore, labelScore > 0)
         }
 
-        guard let best = scored.max(by: { $0.score < $1.score }) else {
-            return nil
+        if let best = labelMatchedBoxes.min(by: { $0.distance < $1.distance }) {
+            return FoundElement(
+                label: labelForYoloBox(best.box, ocrElements: ocrElements) ?? label,
+                center: best.box.center,
+                bbox: best.box.bbox,
+                confidence: best.box.confidence,
+                cacheAgeMs: ageMs
+            )
         }
 
-        // Sanity check: if no OCR label matched AND the closest box is
-        // more than 400px from the LLM's hint, the label probably isn't
-        // on screen at all (hidden in a menu, behind a dropdown, etc.).
-        // Return nil so the caller falls back to raw LLM coords rather
-        // than snapping to a random faraway box.
-        let distanceFromHint = hypot(best.box.center.x - hint.x, best.box.center.y - hint.y)
-        if !best.labelMatched && distanceFromHint > 400 {
-            return nil
-        }
-
-        return FoundElement(
-            label: labelForYoloBox(best.box, ocrElements: ocrElements) ?? label,
-            center: best.box.center,
-            bbox: best.box.bbox,
-            confidence: best.box.confidence,
-            cacheAgeMs: ageMs
-        )
+        // 3. No box contains the hint and no label-matched box is nearby.
+        //    Returning nil makes the resolver fall back to raw LLM coords
+        //    — Gemini's exact pixel beats a blind nearest-box snap that
+        //    would land on a random sibling in stacked menus.
+        return nil
     }
 
     /// Pick the best OCR text overlapping a YOLO box, for labeling/logging.
