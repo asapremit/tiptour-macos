@@ -276,6 +276,32 @@ final class GeminiLiveClient: @unchecked Sendable {
                 ],
                 "tools": [
                     ["functionDeclarations": [pointAtElementTool, submitWorkflowPlanTool]]
+                ],
+                // Tighten Gemini Live's voice activity detector so it
+                // doesn't fire on ambient noise — typing, fans, breaths,
+                // mouse clicks, the click of the hotkey itself. Without
+                // this the server treats any low-level audio as the
+                // user speaking, hits an end-of-turn after a brief
+                // silence, and emits a proactive narration of whatever
+                // screenshot it last saw. That's the "yapping unprompted
+                // when I open TipTour" symptom.
+                //
+                // The sensitivity values run BACKWARDS from what reads
+                // intuitively in English: in Gemini Live's API, *_LOW
+                // means "less sensitive / requires clearer speech" and
+                // *_HIGH means "more sensitive / fires more easily".
+                // We want LOW on both: a louder/clearer signal to count
+                // as speech start (filter out ambient), and a longer
+                // wait before deciding the user is done (don't cut off
+                // mid-thought on a brief pause). silenceDurationMs of
+                // 1200 reinforces the LOW end-of-speech threshold.
+                "realtimeInputConfig": [
+                    "automaticActivityDetection": [
+                        "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+                        "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                        "prefixPaddingMs": 300,
+                        "silenceDurationMs": 1200
+                    ]
                 ]
             ]
         ]
