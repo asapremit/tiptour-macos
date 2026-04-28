@@ -69,8 +69,8 @@ final class CompanionManager: ObservableObject {
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
-    private var geminiAudioPowerCancellable: AnyCancellable?
-    private var geminiModelSpeakingCancellable: AnyCancellable?
+    private var voiceAudioPowerCancellable: AnyCancellable?
+    private var voiceModelSpeakingCancellable: AnyCancellable?
 
     /// True when all four required permissions (accessibility, screen recording,
     /// microphone, screen content) are granted. Used by the panel to show a single "all good" state.
@@ -78,47 +78,175 @@ final class CompanionManager: ObservableObject {
         hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
     }
 
-    /// Lazily-built Gemini Live session.
-    lazy var geminiLiveSession: GeminiLiveSession = {
-        let session = GeminiLiveSession(
-            apiKeyURL: "\(Self.workerBaseURL)/gemini-live-key",
-            systemPrompt: Self.companionVoiceResponseSystemPrompt
-        )
-        session.onPointAtElement = { [weak self] id, label, screenshotJPEG in
-            await self?.handleToolPointAtElement(id: id, label: label, screenshotJPEG: screenshotJPEG) ?? ["ok": false]
+    /// Which realtime backend the user has selected. Gemini Live by default;
+    /// flipping this to `.openaiRealtime` makes `voiceBackend` rebuild the
+    /// session against OpenAI's gpt-realtime-1.5. Persisted across launches.
+    @Published private(set) var voiceBackendKind: VoiceBackendKind = {
+        if let raw = UserDefaults.standard.string(forKey: VoiceBackendKind.userDefaultsKey),
+           let kind = VoiceBackendKind(rawValue: raw) {
+            return kind
         }
-        session.onSubmitWorkflowPlan = { [weak self] id, goal, app, steps in
+        // OpenAI Realtime is the default for new installs — gpt-realtime-1.5
+        // is GA, supports image input, and tends to follow tool-call rules
+        // more reliably in our testing. Existing installs keep whatever the
+        // user previously chose via the Dev panel toggle.
+        return .openaiRealtime
+    }()
+
+    /// Backing storage for the active voice backend. Built lazily on first
+    /// access via `voiceBackend`; reset to nil by `setVoiceBackendKind` so
+    /// the next access constructs the new kind. Either GeminiLiveSession or
+    /// OpenAIRealtimeSession at runtime — both conform to VoiceBackend.
+    private var _voiceBackend: (any VoiceBackend)?
+
+    /// The active voice backend. Constructs the right concrete kind on
+    /// first access and wires all the tool / transcript callbacks once.
+    /// Subsequent accesses return the cached instance until the user flips
+    /// `voiceBackendKind`.
+    var voiceBackend: any VoiceBackend {
+        if let existing = _voiceBackend { return existing }
+        let backend = makeVoiceBackend(for: voiceBackendKind)
+        _voiceBackend = backend
+        rebindVoiceBackendPublishers(backend)
+        return backend
+    }
+
+    /// Switch the active backend kind. Stops any in-flight session on the
+    /// previous backend, drops it, and persists the user's choice. The
+    /// next push-to-talk press will build + use the new kind.
+    func setVoiceBackendKind(_ kind: VoiceBackendKind) {
+        guard kind != voiceBackendKind else { return }
+        print("[CompanionManager] switching voice backend → \(kind.displayName)")
+        if let existing = _voiceBackend {
+            existing.stop()
+            _voiceBackend = nil
+        }
+        voiceBackendKind = kind
+        UserDefaults.standard.set(kind.rawValue, forKey: VoiceBackendKind.userDefaultsKey)
+        voiceState = .idle
+    }
+
+    private func makeVoiceBackend(for kind: VoiceBackendKind) -> any VoiceBackend {
+        let backend: any VoiceBackend
+        switch kind {
+        case .geminiLive:
+            backend = GeminiLiveSession(
+                apiKeyURL: "\(Self.workerBaseURL)/gemini-live-key",
+                systemPrompt: Self.companionVoiceResponseSystemPrompt
+            )
+        case .openaiRealtime:
+            backend = OpenAIRealtimeSession(
+                ephemeralTokenURL: "\(Self.workerBaseURL)/openai-realtime-token",
+                systemPrompt: Self.companionVoiceResponseSystemPrompt
+            )
+        }
+        wireCallbacks(on: backend)
+        return backend
+    }
+
+    /// Hook all tool / transcript / error callbacks. Identical wiring for
+    /// every backend kind — that's the whole point of the protocol.
+    private func wireCallbacks(on backend: any VoiceBackend) {
+        backend.onPointAtElement = { [weak self] id, label, box2DNormalized, screenshotJPEG in
+            await self?.handleToolPointAtElement(
+                id: id,
+                label: label,
+                box2DNormalized: box2DNormalized,
+                screenshotJPEG: screenshotJPEG
+            ) ?? ["ok": false]
+        }
+        backend.onSubmitWorkflowPlan = { [weak self] id, goal, app, steps in
             await self?.handleToolSubmitWorkflowPlan(id: id, goal: goal, app: app, steps: steps) ?? ["ok": false]
         }
-        session.onOutputTranscript = { [weak self] fullTranscript in
-            self?.handleGeminiTranscriptUpdate(fullTranscript)
+        backend.onOutputTranscript = { [weak self] fullTranscript in
+            self?.handleVoiceTranscriptUpdate(fullTranscript)
         }
-        session.onInputTranscriptUpdate = { [weak self] fullInputTranscript in
+        backend.onInputTranscriptUpdate = { [weak self] fullInputTranscript in
             guard let self else { return }
             let isNewUtterance = fullInputTranscript.trimmingCharacters(in: .whitespacesAndNewlines).count > 0
                 && self.previousInputTranscriptLength == 0
             if isNewUtterance {
                 self.handledToolCallIDsThisUtterance.removeAll()
                 self.planAppliedThisTurn = false
-                self.lastGeminiTranscriptLength = 0
+                self.lastVoiceTranscriptLength = 0
             }
             self.previousInputTranscriptLength = fullInputTranscript.count
         }
-        session.onTurnComplete = { [weak self] in
+        backend.onTurnComplete = { [weak self] in
             self?.previousInputTranscriptLength = 0
         }
-        session.onError = { error in
-            print("[GeminiLive] Error: \(error.localizedDescription)")
+        backend.onError = { error in
+            print("[VoiceBackend] Error: \(error.localizedDescription)")
         }
-        return session
-    }()
+    }
+
+    /// Subscribe to the new backend's audio-power and model-speaking
+    /// publishers. Old subscriptions are cancelled here implicitly by
+    /// reassignment of the `AnyCancellable` storage.
+    private func rebindVoiceBackendPublishers(_ backend: any VoiceBackend) {
+        voiceAudioPowerCancellable = backend.currentAudioPowerLevelPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] powerLevel in
+                self?.currentAudioPowerLevel = powerLevel
+            }
+        voiceModelSpeakingCancellable = backend.isModelSpeakingPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isSpeaking in
+                guard let self = self, self.voiceBackend.isActive else { return }
+                self.voiceState = isSpeaking ? .responding : .listening
+            }
+    }
+
+    // MARK: - box_2d → screenshot-pixel conversion
+
+    /// Convert Gemini's `box_2d` (in normalized [y1, x1, y2, x2] form, each
+    /// value in [0, 1000]) to the box's center in screenshot-pixel space.
+    /// Returns nil when no valid box was provided OR when we don't yet have
+    /// a screenshot to scale against.
+    ///
+    /// Why box_2d at all: Gemini 2.5 / 3.x is natively trained to localize
+    /// in this exact format. Asking for free-form (x, y) integers makes the
+    /// model do mental math against a downscaled image it never sees the
+    /// resolution of, which hurts pixel precision. box_2d normalizes that
+    /// away — the model emits the same format the docs prescribe and we
+    /// scale to the real screenshot dimensions on our side.
+    private func pixelHintFromBox2D(
+        box2DNormalized: [Int]?,
+        capture: CompanionScreenCapture?
+    ) -> CGPoint? {
+        guard let box = box2DNormalized, box.count == 4, let capture else {
+            return nil
+        }
+        let y1Norm = CGFloat(box[0])
+        let x1Norm = CGFloat(box[1])
+        let y2Norm = CGFloat(box[2])
+        let x2Norm = CGFloat(box[3])
+
+        let centerNormX = (x1Norm + x2Norm) / 2
+        let centerNormY = (y1Norm + y2Norm) / 2
+
+        let screenshotWidth = CGFloat(capture.screenshotWidthInPixels)
+        let screenshotHeight = CGFloat(capture.screenshotHeightInPixels)
+
+        let pixelX = centerNormX * screenshotWidth / 1000
+        let pixelY = centerNormY * screenshotHeight / 1000
+        return CGPoint(x: pixelX, y: pixelY)
+    }
 
     // MARK: - Tool Handlers
 
     /// Handle the `point_at_element` tool call. Resolves the label via the
-    /// AX tree → YOLO + OCR cascade and flies the cursor there.
+    /// AX tree → YOLO + OCR cascade and flies the cursor there. When Gemini
+    /// supplies a `box_2d`, its center (in screenshot-pixel space) is fed
+    /// to the resolver as a coordinate hint for the YOLO and raw-LLM-coord
+    /// fallbacks.
     @MainActor
-    private func handleToolPointAtElement(id: String, label: String, screenshotJPEG: Data?) async -> [String: Any] {
+    private func handleToolPointAtElement(
+        id: String,
+        label: String,
+        box2DNormalized: [Int]?,
+        screenshotJPEG: Data?
+    ) async -> [String: Any] {
         if handledToolCallIDsThisUtterance.contains(id) {
             print("[Tool] ⏭️  ignoring duplicate point_at_element id=\(id)")
             return ["ok": true, "duplicate": true]
@@ -131,19 +259,27 @@ final class CompanionManager: ObservableObject {
             print("[Tool] 🔄 superseding active plan \"\(activePlan.goal)\" — user asked for a single element \"\(label)\"")
             WorkflowRunner.shared.stop()
         }
-        print("[Tool] 🔧 point_at_element(label=\"\(label)\")")
+        let capture = voiceBackend.latestCapture
+        let hintInScreenshotPixels = pixelHintFromBox2D(
+            box2DNormalized: box2DNormalized,
+            capture: capture
+        )
+        if let hintInScreenshotPixels {
+            print("[Tool] 🔧 point_at_element(label=\"\(label)\", box_2d=\(box2DNormalized ?? []) → screenshot pixel \(hintInScreenshotPixels))")
+        } else {
+            print("[Tool] 🔧 point_at_element(label=\"\(label)\")")
+        }
         let startedAt = Date()
         planAppliedThisTurn = true
-        let capture = geminiLiveSession.latestCapture
         let resolution = await ElementResolver.shared.resolve(
             label: label,
-            llmHintInScreenshotPixels: nil,
+            llmHintInScreenshotPixels: hintInScreenshotPixels,
             latestCapture: capture
         )
         let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
         guard let resolution else {
             print("[Tool] ✗ point_at_element(\"\(label)\") → no match after \(elapsed)ms")
-            geminiLiveSession.invalidateScreenshotHashCache()
+            voiceBackend.invalidateScreenshotHashCache()
             return ["ok": false, "reason": "element_not_found", "label": label]
         }
         print("[Tool] ✓ point_at_element(\"\(label)\") → \(resolution.label) via \(resolution.source) in \(elapsed)ms")
@@ -155,7 +291,7 @@ final class CompanionManager: ObservableObject {
 
         // Mute screenshot pushes until the user speaks again so Gemini doesn't
         // re-emit the same tool call on a "user hasn't moved" frame.
-        geminiLiveSession.suppressScreenshotsUntilUserSpeaks()
+        voiceBackend.suppressScreenshotsUntilUserSpeaks()
 
         return [
             "ok": true,
@@ -192,18 +328,29 @@ final class CompanionManager: ObservableObject {
         print("[Tool] 🔧 submit_workflow_plan(goal=\"\(goal)\", app=\"\(app)\", \(steps.count) steps)")
         planAppliedThisTurn = true
 
+        let captureForBoxConversion = voiceBackend.latestCapture
         let parsedSteps: [WorkflowStep] = steps.enumerated().map { index, raw in
             let label = raw["label"] as? String
             let hint = raw["hint"] as? String ?? ""
-            let x = raw["x"] as? Int
-            let y = raw["y"] as? Int
+
+            // Convert Gemini's box_2d ([y1, x1, y2, x2] in [0, 1000]) to
+            // the box's center in screenshot-pixel space. The downstream
+            // resolver / YOLO pipeline expects pixel coords.
+            let box2DNormalized = (raw["box_2d"] as? [Int]).flatMap { $0.count == 4 ? $0 : nil }
+            let pixelCenter = pixelHintFromBox2D(
+                box2DNormalized: box2DNormalized,
+                capture: captureForBoxConversion
+            )
+            let hintX = pixelCenter.map { Int($0.x) }
+            let hintY = pixelCenter.map { Int($0.y) }
+
             return WorkflowStep(
                 id: "step_\(index + 1)",
                 type: .click,
                 label: label,
                 hint: hint,
-                hintX: x,
-                hintY: y,
+                hintX: hintX,
+                hintY: hintY,
                 screenNumber: nil
             )
         }
@@ -222,13 +369,13 @@ final class CompanionManager: ObservableObject {
         print("[Tool] ✓ submit_workflow_plan → \(plan.app ?? "?"): \(stepLabels)")
         startWorkflowPlan(plan)
 
-        geminiLiveSession.suppressScreenshotsUntilUserSpeaks()
+        voiceBackend.suppressScreenshotsUntilUserSpeaks()
 
         // Pause mic + screenshots so Gemini can narrate the plan in one
         // uninterrupted turn. Once narration finishes, exit narration mode
         // — mic/screenshots resume but the WebSocket stays open.
         print("[Workflow] entering Gemini narration mode — mic/screenshots paused, socket kept alive for narration")
-        geminiLiveSession.enterNarrationMode()
+        voiceBackend.enterNarrationMode()
         scheduleExitNarrationModeAfterSpeechEnds()
 
         return [
@@ -258,9 +405,9 @@ final class CompanionManager: ObservableObject {
 
                 let (isActive, speaking, playing) = await MainActor.run { () -> (Bool, Bool, Bool) in
                     (
-                        self.geminiLiveSession.isActive,
-                        self.geminiLiveSession.isModelSpeaking,
-                        self.geminiLiveSession.isAudioPlaying
+                        self.voiceBackend.isActive,
+                        self.voiceBackend.isModelSpeaking,
+                        self.voiceBackend.isAudioPlaying
                     )
                 }
                 if !isActive { return }
@@ -288,9 +435,9 @@ final class CompanionManager: ObservableObject {
             }
 
             await MainActor.run {
-                guard self.geminiLiveSession.isActive else { return }
+                guard self.voiceBackend.isActive else { return }
                 print("[Workflow] narration window closed — exiting narration mode, session stays alive for follow-ups")
-                self.geminiLiveSession.exitNarrationMode()
+                self.voiceBackend.exitNarrationMode()
                 self.planAppliedThisTurn = false
             }
         }
@@ -411,7 +558,11 @@ final class CompanionManager: ObservableObject {
         refreshAllPermissions()
         print("🔑 TipTour start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
-        bindAudioPowerLevel()
+        // Touch the lazy property so the backend is constructed and the
+        // publishers are subscribed BEFORE the user opens the panel /
+        // presses the hotkey. Subsequent kind switches re-bind via
+        // setVoiceBackendKind → next access of `voiceBackend`.
+        _ = voiceBackend
         bindShortcutTransitions()
         beginTrackingUserTargetApp()
         ClickDetector.advanceOnAnyClickEnabled = advanceOnAnyClickEnabled
@@ -433,8 +584,8 @@ final class CompanionManager: ObservableObject {
         shortcutTransitionCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
         accessibilityCheckTimer = nil
-        geminiAudioPowerCancellable?.cancel()
-        geminiModelSpeakingCancellable?.cancel()
+        voiceAudioPowerCancellable?.cancel()
+        voiceModelSpeakingCancellable?.cancel()
     }
 
     func clearDetectedElementLocation() {
@@ -540,23 +691,6 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    private func bindAudioPowerLevel() {
-        geminiAudioPowerCancellable = geminiLiveSession.$currentAudioPowerLevel
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] powerLevel in
-                self?.currentAudioPowerLevel = powerLevel
-            }
-
-        // When Gemini finishes its turn, drop back to .listening so the
-        // waveform stays visible while the user decides what to say next.
-        geminiModelSpeakingCancellable = geminiLiveSession.$isModelSpeaking
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] isSpeaking in
-                guard let self = self, self.geminiLiveSession.isActive else { return }
-                self.voiceState = isSpeaking ? .responding : .listening
-            }
-    }
-
     private func bindShortcutTransitions() {
         shortcutTransitionCancellable = globalPushToTalkShortcutMonitor
             .shortcutTransitionPublisher
@@ -614,11 +748,11 @@ final class CompanionManager: ObservableObject {
             // Gemini Live uses TOGGLE behavior — press once to start, press
             // again to end. The connection stays open across turns so the
             // user can have a real conversation.
-            if geminiLiveSession.isActive {
-                stopGeminiLiveSession()
+            if voiceBackend.isActive {
+                stopVoiceSession()
                 voiceState = .idle
             } else {
-                startGeminiLiveSession()
+                startVoiceSession()
                 voiceState = .listening
             }
         case .released:
@@ -683,9 +817,10 @@ final class CompanionManager: ObservableObject {
 
     you have exactly TWO tools. call AT MOST ONE tool per turn. do NOT narrate before the tool call. call it silently, wait for the response, THEN speak ONCE.
 
-    TOOL: point_at_element(label)
+    TOOL: point_at_element(label, box_2d?)
       use for a SINGLE visible element. examples: "where's the save button", "point at the color inspector", "what is this tab".
       label = literal visible text on screen.
+      box_2d = OPTIONAL bounding box in [y1, x1, y2, x2] form, each value in [0, 1000] normalized to the screenshot. origin top-left, y first. include this whenever you can — it's how this model is natively trained to localize. ALWAYS include it for apps without accessibility (Blender, games, canvas tools) and whenever the label is ambiguous.
 
     UI ELEMENT HINTS (set-of-marks):
     alongside screenshots you will sometimes receive a "UI elements on screen" message listing pointable elements as [role:label] tokens — for example [button:Save] [menu:File] [item:New File...] [tab:Preview] [field:Search].
@@ -723,7 +858,8 @@ final class CompanionManager: ObservableObject {
       arguments:
         goal  = short summary of the user's intent ("create a new file", "render an animation").
         app   = exact foreground app name visible in the screenshot ("Blender", "Xcode", "GarageBand"). never "macOS" or "unknown".
-        steps = ordered array of {label, hint, x?, y?}. first step MUST be visible on the current screen. subsequent steps describe the path to take after clicking step 1; x/y optional on those. include x,y on step 1 only when the app lacks accessibility support (Blender, games, canvas tools).
+        steps = ordered array of {label, hint, box_2d?}. first step MUST be visible on the current screen. subsequent steps describe the path to take after clicking step 1.
+        box_2d = OPTIONAL bounding box for the step's element in [y1, x1, y2, x2] form, each value in [0, 1000] normalized to the current screenshot. origin top-left, y first. include it whenever you can on step 1 — it's how this model is natively trained to localize. ALWAYS include it for apps without accessibility (Blender, games, canvas tools).
 
     ABSOLUTE RULES:
     - exactly ONE tool call per turn. never both tools, never the same tool twice.
@@ -837,14 +973,14 @@ final class CompanionManager: ObservableObject {
     // MARK: - Gemini Live Mode
 
     /// Track the last parsed transcript prefix so we only process new [POINT:] tags once.
-    private var lastGeminiTranscriptLength: Int = 0
+    private var lastVoiceTranscriptLength: Int = 0
 
     /// Called whenever Gemini's output transcript grows — scans for [POINT:]
     /// tags and triggers cursor pointing for each new one.
-    private func handleGeminiTranscriptUpdate(_ fullTranscript: String) {
-        guard fullTranscript.count > lastGeminiTranscriptLength else { return }
-        let newPortion = String(fullTranscript.suffix(fullTranscript.count - lastGeminiTranscriptLength))
-        lastGeminiTranscriptLength = fullTranscript.count
+    private func handleVoiceTranscriptUpdate(_ fullTranscript: String) {
+        guard fullTranscript.count > lastVoiceTranscriptLength else { return }
+        let newPortion = String(fullTranscript.suffix(fullTranscript.count - lastVoiceTranscriptLength))
+        lastVoiceTranscriptLength = fullTranscript.count
 
         if planAppliedThisTurn { return }
 
@@ -856,7 +992,7 @@ final class CompanionManager: ObservableObject {
         }
 
         let hint = parseResult.coordinate
-        let capture = geminiLiveSession.latestCapture
+        let capture = voiceBackend.latestCapture
 
         Task {
             guard let resolution = await ElementResolver.shared.resolve(
@@ -880,7 +1016,7 @@ final class CompanionManager: ObservableObject {
             pointHandler: { [weak self] resolution in
                 self?.pointAtResolution(resolution)
             },
-            latestCapture: geminiLiveSession.latestCapture
+            latestCapture: voiceBackend.latestCapture
         )
     }
 
@@ -892,8 +1028,8 @@ final class CompanionManager: ObservableObject {
     /// By the time Gemini's first response streams back, both the YOLO cache
     /// and the AX tree are already hot — so the very first tool call resolves
     /// as accurately as every subsequent one.
-    func startGeminiLiveSession() {
-        lastGeminiTranscriptLength = 0
+    func startVoiceSession() {
+        lastVoiceTranscriptLength = 0
 
         Task.detached(priority: .userInitiated) {
             await Self.warmLocalResolvers()
@@ -901,7 +1037,7 @@ final class CompanionManager: ObservableObject {
 
         Task {
             do {
-                try await geminiLiveSession.start(initialScreenshot: nil)
+                try await voiceBackend.start(initialScreenshot: nil)
             } catch {
                 print("[GeminiLive] Failed to start session: \(error.localizedDescription)")
             }
@@ -919,9 +1055,9 @@ final class CompanionManager: ObservableObject {
     }
 
     /// End the Gemini Live session.
-    func stopGeminiLiveSession() {
+    func stopVoiceSession() {
         WorkflowRunner.shared.stop()
         planAppliedThisTurn = false
-        geminiLiveSession.stop()
+        voiceBackend.stop()
     }
 }

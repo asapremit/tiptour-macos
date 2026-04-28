@@ -1,19 +1,31 @@
 /**
  * TipTour Proxy Worker
  *
- * Thin Cloudflare Worker that exposes the Gemini API key for direct
- * WebSocket connections and provides a multilingual label matcher.
- * Keys are stored as Cloudflare secrets.
+ * Thin Cloudflare Worker that brokers credentials for the two voice
+ * backends (Gemini Live and OpenAI Realtime) and provides a multilingual
+ * label matcher. Keys are stored as Cloudflare secrets — the app never
+ * sees them; for OpenAI the app receives short-lived ephemeral tokens
+ * minted on demand, which is the production-grade auth pattern.
  *
  * Routes:
- *   GET  /gemini-live-key  → returns the Gemini API key so the app can
- *                            open a direct WebSocket to Gemini Live.
- *   POST /match-label      → Multilingual label matcher used by the
- *                            in-app ElementResolver fallback.
+ *   GET  /gemini-live-key       → returns the Gemini API key so the app can
+ *                                  open a direct WebSocket to Gemini Live.
+ *                                  (Cloudflare can't proxy Gemini's
+ *                                  WebSocket, so trusted clients get the
+ *                                  raw key — to be replaced once Google
+ *                                  ships ephemeral tokens for v1beta.)
+ *   POST /openai-realtime-token → mints a short-lived OpenAI Realtime
+ *                                  ephemeral token (`/v1/realtime/client_secrets`).
+ *                                  The app uses it as the bearer token on
+ *                                  the WebSocket; raw OPENAI_API_KEY never
+ *                                  leaves the worker.
+ *   POST /match-label           → Multilingual label matcher used by the
+ *                                  in-app ElementResolver fallback.
  */
 
 interface Env {
   GEMINI_API_KEY: string;
+  OPENAI_API_KEY?: string;
 }
 
 export default {
@@ -34,6 +46,10 @@ export default {
     try {
       if (url.pathname === "/match-label") {
         return await handleMatchLabel(request, env);
+      }
+
+      if (url.pathname === "/openai-realtime-token") {
+        return await handleOpenAIRealtimeToken(env);
       }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
@@ -121,6 +137,63 @@ async function handleMatchLabel(request: Request, env: Env): Promise<Response> {
   return new Response(data, {
     status: 200,
     headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * /openai-realtime-token
+ *
+ * Mints a short-lived OpenAI Realtime ephemeral token via
+ * `POST https://api.openai.com/v1/realtime/client_secrets`. The app uses
+ * this token as the WebSocket bearer when connecting directly to
+ * `wss://api.openai.com/v1/realtime`, so the long-lived OPENAI_API_KEY
+ * never leaves this worker.
+ *
+ * Per OpenAI's docs ephemeral tokens are designed exactly for this case
+ * (insecure clients connecting to Realtime over WebSocket / WebRTC).
+ * Default lifetime is short — the app refreshes by hitting this endpoint
+ * again whenever it starts a new session.
+ *
+ * Body: ignored (the model + voice + tool config is sent later by the
+ *       client's `session.update` event over the live WebSocket).
+ *
+ * Returns: the raw JSON envelope from OpenAI, which contains the token
+ *          inside `client_secret.value` and an absolute expiry timestamp.
+ *          The app reads `client_secret.value` and ignores the rest.
+ */
+async function handleOpenAIRealtimeToken(env: Env): Promise<Response> {
+  if (!env.OPENAI_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "OPENAI_API_KEY not configured on the worker" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    // Pass an empty body — model and session config are applied later via
+    // `session.update` once the WebSocket is open. Keeps this route generic
+    // so we can change models without redeploying.
+    body: JSON.stringify({}),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/openai-realtime-token] OpenAI error ${response.status}: ${errorBody}`);
+    return new Response(
+      JSON.stringify({ error: `OpenAI rejected token request (${response.status})` }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const data = await response.text();
+  return new Response(data, {
+    status: 200,
+    headers: { "content-type": "application/json", "cache-control": "no-cache" },
   });
 }
 

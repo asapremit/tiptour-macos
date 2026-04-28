@@ -18,7 +18,24 @@ import Combine
 import Foundation
 
 @MainActor
-final class GeminiLiveSession: ObservableObject {
+final class GeminiLiveSession: ObservableObject, VoiceBackend {
+
+    // MARK: - VoiceBackend Publisher Conformance
+
+    /// Type-erased projections of the `@Published` state above so
+    /// CompanionManager can subscribe through the protocol without
+    /// pinning to the concrete type. Identical signal as `$x` —
+    /// just sliced behind a uniform interface. The accessors stay on
+    /// the MainActor because `@Published`'s projected value is itself
+    /// MainActor-isolated; the subscriber receives values on its own
+    /// queue via `.receive(on:)` like before.
+    var currentAudioPowerLevelPublisher: AnyPublisher<CGFloat, Never> {
+        $currentAudioPowerLevel.eraseToAnyPublisher()
+    }
+    var isModelSpeakingPublisher: AnyPublisher<Bool, Never> {
+        $isModelSpeaking.eraseToAnyPublisher()
+    }
+
 
     // MARK: - Published State (bindable from SwiftUI)
 
@@ -71,12 +88,15 @@ final class GeminiLiveSession: ObservableObject {
     /// Fires on fatal errors so the caller can surface them to the user.
     var onError: ((Error) -> Void)?
 
-    /// Fired when Gemini calls `point_at_element(label)`. The handler must
-    /// resolve the label to a screen position, point the cursor there, and
+    /// Fired when Gemini calls `point_at_element(label, box_2d?)`. The handler
+    /// must resolve the label to a screen position, point the cursor there, and
     /// return a short dictionary describing the result. That dictionary is
     /// sent back to Gemini as the tool response so it can continue narrating
-    /// with knowledge of what was pointed at.
-    var onPointAtElement: ((_ id: String, _ label: String, _ screenshotJPEG: Data?) async -> [String: Any])?
+    /// with knowledge of what was pointed at. `box2DNormalized` is Gemini's
+    /// optional bounding box in [y1, x1, y2, x2] form, each value in [0, 1000]
+    /// relative to the screenshot Gemini saw last; nil when Gemini didn't
+    /// supply one (e.g. it's confident the AX label resolves on its own).
+    var onPointAtElement: ((_ id: String, _ label: String, _ box2DNormalized: [Int]?, _ screenshotJPEG: Data?) async -> [String: Any])?
 
     /// Fired when Gemini calls `submit_workflow_plan(goal, app, steps)`.
     /// Gemini produces the plan itself via its own vision + reasoning, so
@@ -804,8 +824,9 @@ final class GeminiLiveSession: ObservableObject {
             switch name {
             case "point_at_element":
                 let label = (args["label"] as? String) ?? ""
+                let box2D = (args["box_2d"] as? [Int]).flatMap { $0.count == 4 ? $0 : nil }
                 if !label.isEmpty, let handler = onPointAtElement {
-                    response = await handler(id, label, screenshot)
+                    response = await handler(id, label, box2D, screenshot)
                 } else {
                     print("[GeminiLiveSession] point_at_element called with no handler or empty label")
                 }

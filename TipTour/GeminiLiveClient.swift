@@ -181,6 +181,13 @@ final class GeminiLiveClient: @unchecked Sendable {
                     "label": [
                         "type": "string",
                         "description": "The literal visible text of the element — e.g. 'Save', 'File', 'Source Control'. Use the actual text on screen, not a description."
+                    ],
+                    "box_2d": [
+                        "type": "array",
+                        "description": "Optional bounding box for the element in normalized [y1, x1, y2, x2] form, each value in [0, 1000] relative to the screenshot. RECOMMENDED for apps without accessibility (Blender, games, canvas tools) and for ambiguous labels. Origin is top-left, y comes first.",
+                        "items": ["type": "integer"],
+                        "minItems": 4,
+                        "maxItems": 4
                     ]
                 ],
                 "required": ["label"]
@@ -219,13 +226,12 @@ final class GeminiLiveClient: @unchecked Sendable {
                                     "type": "string",
                                     "description": "Short sentence describing this step — e.g. 'Open the File menu'."
                                 ],
-                                "x": [
-                                    "type": "integer",
-                                    "description": "Optional pixel x-coordinate in the screenshot's coordinate space. Only needed for step 1, and only if the app lacks accessibility support (Blender, games, canvas tools)."
-                                ],
-                                "y": [
-                                    "type": "integer",
-                                    "description": "Optional pixel y-coordinate in the screenshot's coordinate space."
+                                "box_2d": [
+                                    "type": "array",
+                                    "description": "Optional bounding box for the element in normalized [y1, x1, y2, x2] form, each value in [0, 1000] relative to the current screenshot. Origin is top-left, y comes first. Recommended for step 1 in apps without accessibility (Blender, games, canvas tools) and for ambiguous labels.",
+                                    "items": ["type": "integer"],
+                                    "minItems": 4,
+                                    "maxItems": 4
                                 ]
                             ],
                             "required": ["label"]

@@ -2,5 +2,29 @@
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
         <title>TipTour</title>
+        <item>
+            <title>0.3</title>
+            <pubDate>Tue, 28 Apr 2026 23:58:33 +0530</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/milind-soni/tiptour-releases/releases/download/v0.3/TipTour.dmg" length="42463441" type="application/octet-stream"/>
+        </item>
+        <item>
+            <title>0.2</title>
+            <pubDate>Tue, 28 Apr 2026 23:35:20 +0530</pubDate>
+            <sparkle:version>2</sparkle:version>
+            <sparkle:shortVersionString>0.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/milind-soni/tiptour-releases/releases/download/v0.2/TipTour.dmg" length="42452601" type="application/octet-stream"/>
+        </item>
+        <item>
+            <title>0.1</title>
+            <pubDate>Tue, 28 Apr 2026 18:19:53 +0530</pubDate>
+            <sparkle:version>1</sparkle:version>
+            <sparkle:shortVersionString>0.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/milind-soni/tiptour-releases/releases/download/v0.1/TipTour.dmg" length="42414279" type="application/octet-stream"/>
+        </item>
     </channel>
 </rss>

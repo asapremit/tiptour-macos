@@ -36,6 +36,12 @@ final class MenuBarPanelManager: NSObject {
     private var clickOutsideMonitor: Any?
     private var dismissPanelObserver: NSObjectProtocol?
     private var pinStateChangedObserver: NSObjectProtocol?
+    /// KVO observation that fires whenever the SwiftUI hosting view's
+    /// fitting size changes — e.g. when the user expands the Developer
+    /// disclosure section or a workflow checklist appears mid-session.
+    /// We resize the NSPanel in response so the new content is fully
+    /// visible instead of clipped (or rendering above the panel).
+    private var hostingViewSizeObservation: NSKeyValueObservation?
 
     private let companionManager: CompanionManager
     private let panelWidth: CGFloat = 320
@@ -177,6 +183,14 @@ final class MenuBarPanelManager: NSObject {
         hostingView.frame = NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight)
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = .clear
+        // Have NSHostingView track SwiftUI's preferred size so its
+        // `fittingSize` (and `intrinsicContentSize`) update whenever
+        // the embedded view's content changes — e.g. when the
+        // Developer disclosure expands or a workflow checklist shows.
+        // Without this the hosting view stays at the size we gave it
+        // at init and SwiftUI renders content beyond the bottom of the
+        // panel, which looks like the dropdown is "spilling out above".
+        hostingView.sizingOptions = [.intrinsicContentSize]
 
         let menuBarPanel = KeyablePanel(
             contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight),
@@ -199,28 +213,53 @@ final class MenuBarPanelManager: NSObject {
 
         menuBarPanel.contentView = hostingView
         panel = menuBarPanel
+
+        // Resize the NSPanel any time the SwiftUI content's fitting size
+        // changes. KVO fires on the main thread; `setFrame` here keeps
+        // the bottom edge anchored under the menu bar by recomputing
+        // origin.y (smaller content → larger origin.y → panel sits flush
+        // with the menu bar even after collapsing).
+        hostingViewSizeObservation = hostingView.observe(\.fittingSize, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                // Only react to live size changes after the panel is on
+                // screen. Initial sizing during showPanel() goes through
+                // positionPanelBelowStatusItem() before the panel becomes
+                // visible — that path needs to position regardless.
+                guard let panel = self?.panel, panel.isVisible else { return }
+                self?.repositionPanelToMatchContentSize()
+            }
+        }
     }
 
-    private func positionPanelBelowStatusItem() {
+    /// Recompute the panel's frame from the hosting view's current
+    /// `fittingSize`. Anchors the top edge directly under the menu bar
+    /// (gap stays constant) so the panel grows downward when content
+    /// expands and shrinks back up when it collapses.
+    private func repositionPanelToMatchContentSize() {
         guard let panel else { return }
         guard let buttonWindow = statusItem?.button?.window else { return }
+        guard let contentView = panel.contentView else { return }
 
         let statusItemFrame = buttonWindow.frame
         let gapBelowMenuBar: CGFloat = 4
 
-        // Calculate the panel's content height from the hosting view's fitting size
-        // so the panel snugly wraps the SwiftUI content instead of using a fixed height.
-        let fittingSize = panel.contentView?.fittingSize ?? CGSize(width: panelWidth, height: panelHeight)
-        let actualPanelHeight = fittingSize.height
+        let fittingSize = contentView.fittingSize
+        let actualPanelHeight = max(fittingSize.height, 1)
 
-        // Horizontally center the panel beneath the status item icon
         let panelOriginX = statusItemFrame.midX - (panelWidth / 2)
         let panelOriginY = statusItemFrame.minY - actualPanelHeight - gapBelowMenuBar
 
         panel.setFrame(
             NSRect(x: panelOriginX, y: panelOriginY, width: panelWidth, height: actualPanelHeight),
-            display: true
+            display: true,
+            animate: false
         )
+    }
+
+    private func positionPanelBelowStatusItem() {
+        // Initial sizing on show — same math as the live KVO-driven
+        // resize so the first frame is correct before content shifts.
+        repositionPanelToMatchContentSize()
     }
 
     // MARK: - Click Outside Dismissal
