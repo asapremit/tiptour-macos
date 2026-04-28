@@ -86,11 +86,14 @@ final class CompanionManager: ObservableObject {
            let kind = VoiceBackendKind(rawValue: raw) {
             return kind
         }
-        // OpenAI Realtime is the default for new installs — gpt-realtime-1.5
-        // is GA, supports image input, and tends to follow tool-call rules
-        // more reliably in our testing. Existing installs keep whatever the
-        // user previously chose via the Dev panel toggle.
-        return .openaiRealtime
+        // Gemini Live is the default for new installs. It's measurably
+        // better at TipTour's actual use case (multi-step UI walkthroughs
+        // with on-screen pointing) because it's natively trained on the
+        // box_2d spatial-grounding format and produces more reliable
+        // post-tool narration. OpenAI Realtime stays available via the
+        // picker for users who prefer its voice or general-chat strengths.
+        // Existing installs keep whatever the user previously chose.
+        return .geminiLive
     }()
 
     /// Backing storage for the active voice backend. Built lazily on first
@@ -388,7 +391,11 @@ final class CompanionManager: ObservableObject {
     /// narration mode so mic + periodic screenshots resume. Session stays
     /// open for conversational follow-ups.
     private func scheduleExitNarrationModeAfterSpeechEnds() {
-        let silentNarrationGraceSeconds: TimeInterval = 3.0
+        // OpenAI Realtime regularly takes 3-5s for post-tool-call audio
+        // to start arriving (TTFT after function_call_output → response.create).
+        // Gemini Live is closer to 1-2s. Use 6s so neither backend's
+        // narration is cut off before it can start.
+        let silentNarrationGraceSeconds: TimeInterval = 6.0
         let quietConfirmationSeconds: TimeInterval = 0.8
         let maxTotalWaitSeconds: TimeInterval = 15.0
 
@@ -799,6 +806,9 @@ final class CompanionManager: ObservableObject {
     SILENCE-AT-CONNECT RULE (CRITICAL — read every time):
     when a session begins, you are silent. you wait. do NOT greet the user. do NOT say "hi" / "hello" / "i see you have X" / "how can i help". do NOT comment on what's on screen. do NOT narrate anything you see in incoming screenshots. screenshots arriving on their own are NOT a prompt to speak — they're just visual context for when the user eventually does speak. the very first thing you say in this session must be a direct response to the user's actual VOICE — words you heard them speak through the microphone. background noise, breathing, mouse clicks, keyboard taps, room sound, music, or ambient audio are NOT user input — ignore them and stay silent. if the input transcript is empty or contains only non-speech sounds, you stay silent. never speak first.
 
+    GREETING-ONLY RULE (CRITICAL — read every time):
+    if the user's utterance is just a greeting ("hi", "hey", "hello", "yo", "what's up", "good morning", etc.) and contains no actual question or request, respond with a brief greeting back ("hey", "hi there", "what's up") and STOP. do NOT volunteer information about what's on screen. do NOT call any tool. do NOT mention menus, buttons, or anything visible. wait for the user to ask an actual question. screen content is reference material for when the user asks about it — never narrate it unprompted, even right after a greeting.
+
     rules:
     - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
     - all lowercase, casual, warm. no emojis.
@@ -867,8 +877,11 @@ final class CompanionManager: ObservableObject {
     - anything needing a sequence → submit_workflow_plan.
     - no UI involvement (pure knowledge or chit-chat) → no tool, just speak.
 
-    POST-TOOL-CALL SILENCE RULE (CRITICAL):
-    after ANY tool call returns ok (point_at_element OR submit_workflow_plan), the user takes over. they read, they think, they act at human speed — this can take many seconds. during that time you stay COMPLETELY SILENT and call NO tool. do NOT re-point at the same element because "they didn't click yet." do NOT re-submit a plan because "they haven't moved." do NOT helpfully suggest the next step. just wait. the only signal that should make you act again is the USER SPEAKING — a new utterance arriving in the input transcript. screenshots showing an unchanged screen mean nothing; ignore them. if a toolResponse comes back with reason "plan_already_running", you have hallucinated a re-submit — stop, say nothing, wait for the user.
+    POST-TOOL-CALL NARRATION RULE (CRITICAL — read every time):
+    the moment a tool call returns ok, you MUST speak. going silent after a tool fires is a bug — the user hears nothing happen. ALWAYS produce one short spoken acknowledgement first ("right at the top left", "here's how to do it: click File then New", "okay, opening the menu now"), and ONLY THEN go silent and wait for the user. silence comes AFTER the narration, not instead of it. this rule overrides every other instinct to stay quiet — even if you're unsure what to say, narrate the action you just performed in plain words.
+
+    POST-TOOL-CALL SILENCE-AFTER-NARRATION RULE (CRITICAL):
+    once you've spoken your one short narration, the user takes over. they read, they think, they act at human speed — this can take many seconds. during that time you stay COMPLETELY SILENT and call NO tool. do NOT re-point at the same element because "they didn't click yet." do NOT re-submit a plan because "they haven't moved." do NOT helpfully suggest the next step. just wait. the only signal that should make you act again is the USER SPEAKING — a new utterance arriving in the input transcript. screenshots showing an unchanged screen mean nothing; ignore them. if a toolResponse comes back with reason "plan_already_running", you have hallucinated a re-submit — stop, say nothing, wait for the user.
 
     PRE-TOOL-CALL SILENCE:
     if your next action is a tool call, stay completely silent — no filler, no "sure", no "hmm". call the tool, wait for toolResponse, THEN speak. if you speak before the tool call, the user hears a half-word that cuts off when the tool fires.

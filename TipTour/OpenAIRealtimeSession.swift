@@ -96,6 +96,23 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
     /// same tool call in a "user hasn't moved yet" loop.
     private var areScreenshotsSuppressedUntilUserSpeaks: Bool = false
 
+    /// Wall-clock time of the most recent audio chunk we received from
+    /// the model. Used by the echo guard on `.interrupted` so server-VAD
+    /// false alarms triggered by speaker bleed don't cut the model off.
+    private var lastAudioChunkReceivedAt: Date = .distantPast
+
+    /// Standalone task that polls audioPlayer.isPlaying after turnComplete
+    /// and only flips isModelSpeaking false once the queue actually drains.
+    /// Cancelled if a new turn starts in the meantime.
+    private var modelSpeakingFlipTask: Task<Void, Never>?
+
+    /// How recent an audio chunk has to be for an `.interrupted` event to
+    /// be treated as echo (and ignored). Speaker → mic round-trip on a
+    /// laptop is ~50-150ms; 300ms gives generous slack without hiding
+    /// real user barge-ins (which the user keeps producing for many
+    /// seconds beyond this window).
+    private let echoGuardWindowMs: Int = 300
+
     // MARK: - Init
 
     init(ephemeralTokenURL: String, systemPrompt: String) {
@@ -159,6 +176,9 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
         }
 
         try startMicCapture()
+        // Prime the player node now that the shared engine is running, so
+        // the first audio chunk plays without scheduling latency.
+        audioPlayer.startPlaying()
         startPeriodicScreenshotUpdates()
         print("[OpenAIRealtimeSession] Session started")
     }
@@ -180,21 +200,53 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
     func enterNarrationMode() {
         guard isActive else { return }
         isInNarrationMode = true
-        stopMicCapture()
+        // Narration mode pauses only the MIC TAP — the engine + player
+        // stay alive so the model's narration audio still plays back.
+        // Calling stopMicCapture() here detached the player and dropped
+        // every audio chunk the model sent during narration.
+        pauseMicTapForNarration()
         stopPeriodicScreenshotUpdates()
-        print("[OpenAIRealtimeSession] Narration mode entered (mic + screenshots paused)")
+        print("[OpenAIRealtimeSession] Narration mode entered (mic paused, audio playback alive)")
     }
 
     func exitNarrationMode() {
         guard isActive, isInNarrationMode else { return }
         isInNarrationMode = false
         do {
-            try startMicCapture()
+            try resumeMicTapAfterNarration()
         } catch {
-            print("[OpenAIRealtimeSession] Failed to restart mic on narration exit: \(error.localizedDescription)")
+            print("[OpenAIRealtimeSession] Failed to resume mic on narration exit: \(error.localizedDescription)")
         }
         startPeriodicScreenshotUpdates()
-        print("[OpenAIRealtimeSession] Narration mode exited (mic + screenshots resumed)")
+        print("[OpenAIRealtimeSession] Narration mode exited (mic resumed)")
+    }
+
+    /// Remove ONLY the mic tap. Engine + attached player keep running so
+    /// the model's narration audio still plays.
+    private func pauseMicTapForNarration() {
+        if isAudioTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            isAudioTapInstalled = false
+        }
+        currentAudioPowerLevel = 0
+    }
+
+    /// Re-install the mic tap on the still-running engine. Doesn't touch
+    /// the engine lifecycle or the player attachment.
+    private func resumeMicTapAfterNarration() throws {
+        guard !isAudioTapInstalled else { return }
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.inputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0 else {
+            throw NSError(domain: "OpenAIRealtimeSession", code: -3,
+                          userInfo: [NSLocalizedDescriptionKey: "Mic format invalid on resume — sample rate \(inputFormat.sampleRate)"])
+        }
+        installMicTap(inputNode: inputNode, inputFormat: inputFormat)
+        // Engine should still be running; if it isn't, restart it.
+        if !audioEngine.isRunning {
+            audioEngine.prepare()
+            try audioEngine.start()
+        }
     }
 
     // MARK: - Screenshot Suppression
@@ -292,6 +344,13 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
 
         case .audioChunk(let pcm16Data):
             isModelSpeaking = true
+            lastAudioChunkReceivedAt = Date()
+            // A new audio chunk means a fresh turn (or continuation of one)
+            // — cancel any pending "flip isModelSpeaking false after queue
+            // drains" task that a previous turnComplete kicked off. We're
+            // speaking again; that task is now stale.
+            modelSpeakingFlipTask?.cancel()
+            modelSpeakingFlipTask = nil
             // GeminiLiveAudioPlayer is hard-coded to 24kHz PCM16 mono.
             // OpenAI Realtime emits the same format, so the same player
             // works as-is — see OpenAIRealtimeClient.outputSampleRate.
@@ -312,12 +371,42 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
             onOutputTranscript?(snapshot)
 
         case .turnComplete:
-            isModelSpeaking = false
+            // Don't flip isModelSpeaking false here. The audio queue is
+            // typically still playing for hundreds of ms after turnComplete
+            // arrives — the mic-tap echo gate keys off isModelSpeaking, so
+            // flipping it false too early lets speaker bleed through to the
+            // server VAD, which interprets it as a barge-in and cuts the
+            // model off mid-sentence. Defer the flip until the player has
+            // actually drained.
             onTurnComplete?()
+            modelSpeakingFlipTask?.cancel()
+            modelSpeakingFlipTask = Task { [weak self] in
+                guard let self else { return }
+                while !Task.isCancelled {
+                    let stillPlaying = await MainActor.run { self.audioPlayer.isPlaying }
+                    if !stillPlaying { break }
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                if Task.isCancelled { return }
+                await MainActor.run { self.isModelSpeaking = false }
+            }
 
         case .interrupted:
+            // Server VAD says someone's talking, but if we just received
+            // model audio in the last `echoGuardWindowMs`, this is almost
+            // certainly speaker bleed and not a real user barge-in. A
+            // legitimate barge-in keeps producing speech_started events
+            // for many seconds; we'll act on a later one once the audio
+            // tail clears.
+            let timeSinceLastAudioMs = Int(Date().timeIntervalSince(lastAudioChunkReceivedAt) * 1000)
+            if timeSinceLastAudioMs < echoGuardWindowMs {
+                print("[OpenAIRealtimeSession] suppressing likely-echo interrupt (\(timeSinceLastAudioMs)ms since last audio chunk)")
+                return
+            }
             audioPlayer.clearQueuedAudio()
             isModelSpeaking = false
+            modelSpeakingFlipTask?.cancel()
+            modelSpeakingFlipTask = nil
 
         case .toolCall(let id, let name, let args):
             handleToolCall(id: id, name: name, args: args)
@@ -346,6 +435,11 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
 
         Task {
             var response: [String: Any] = ["ok": false, "error": "tool_unavailable"]
+            // Per-response instructions to bias the model into actually
+            // speaking after the tool returns. Default for any tool is a
+            // generic "say one short sentence about what you did" — we
+            // override per-tool below for richer narration cues.
+            var followUpInstructions = "Speak ONE short sentence acknowledging the action you just performed. Do NOT go silent. Do NOT call another tool. Speak first, then wait for the user."
 
             switch name {
             case "point_at_element":
@@ -353,6 +447,7 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
                 let box2D = (args["box_2d"] as? [Int]).flatMap { $0.count == 4 ? $0 : nil }
                 if !label.isEmpty, let handler = onPointAtElement {
                     response = await handler(id, label, box2D, screenshot)
+                    followUpInstructions = "You just pointed the cursor at \"\(label)\". Tell the user where it is on screen in ONE short sentence (e.g. 'right at the top left' or 'in the toolbar'). Do NOT call another tool."
                 }
 
             case "submit_workflow_plan":
@@ -361,13 +456,59 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
                 let steps = (args["steps"] as? [[String: Any]]) ?? []
                 if !goal.isEmpty, !steps.isEmpty, let handler = onSubmitWorkflowPlan {
                     response = await handler(id, goal, app, steps)
+                    let stepLabels = steps.compactMap { $0["label"] as? String }
+                    followUpInstructions = "You just submitted a workflow plan to \"\(goal)\" with steps: \(stepLabels.joined(separator: ", ")). Narrate the full sequence the user will follow in ONE natural-sounding turn — describe the path uninterrupted (e.g. 'click File, then New, then File...'). Do NOT pause between steps. Do NOT call another tool."
                 }
 
             default:
                 print("[OpenAIRealtimeSession] unknown tool \(name) — ignoring")
             }
 
-            openaiClient.sendToolResponse(callID: id, output: response)
+            openaiClient.sendToolResponse(
+                callID: id,
+                output: response,
+                followUpInstructions: followUpInstructions
+            )
+
+            // We just asked the model to continue with response.create.
+            // Mark speaking pre-emptively so the narration timer in
+            // CompanionManager sees "audio is coming" — without this,
+            // the loop's silence-grace expires before OpenAI's TTFT
+            // (3-5s typical for post-tool audio) lands the first chunk,
+            // and narration mode exits prematurely.
+            //
+            // Self-clears via the standard turnComplete path when the
+            // model actually finishes, OR via the safety task below if
+            // the model decides not to respond at all and never produces
+            // audio + turnComplete (rare but possible).
+            isModelSpeaking = true
+            lastAudioChunkReceivedAt = Date()
+            modelSpeakingFlipTask?.cancel()
+            modelSpeakingFlipTask = Task { [weak self] in
+                // Hard ceiling: if no audio arrives within 12s, give up
+                // and unstick the mic gate.
+                let postToolDeadline = Date().addingTimeInterval(12)
+                while !Task.isCancelled {
+                    let pending = await MainActor.run { self?.audioPlayer.isPlaying ?? false }
+                    if !pending && Date() > postToolDeadline { break }
+                    if !pending {
+                        // No audio queued yet — keep waiting until either
+                        // audio arrives (which will cancel this task and
+                        // start a fresh one in the audioChunk handler) or
+                        // the deadline passes.
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                        continue
+                    }
+                    // Audio is rendering — the standard turnComplete
+                    // handler now owns the lifecycle. Bow out.
+                    return
+                }
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self?.isModelSpeaking = false
+                    print("[OpenAIRealtimeSession] post-tool narration deadline expired without audio — releasing mic gate")
+                }
+            }
         }
     }
 
@@ -378,7 +519,24 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
         // current input format (AirPods on/off, sample-rate switch).
         audioEngine = AVAudioEngine()
 
+        // Attach the model-audio player to this same engine BEFORE
+        // enabling voice processing. AUVoiceIO is full-duplex — both
+        // mic uplink and speaker downlink have to share an engine so
+        // the AEC has a valid reference signal to subtract.
+        audioPlayer.attach(to: audioEngine)
+
         let inputNode = audioEngine.inputNode
+
+        // Apple's voice processing (AUVoiceIO) was tried here as the
+        // canonical hardware-AEC path, but it fails outright on macOS
+        // setups with aggregate input devices, virtual mics (Krisp,
+        // Loopback, Teams, etc.), or certain Bluetooth modes —
+        // observed live with `failed to run downlink DSP (state fault)`,
+        // `AUVPAggregate Timeout waiting for streams`, and a degraded
+        // 9-channel input format that breaks playback entirely. We rely
+        // on the software echo guards instead (deferred isModelSpeaking
+        // flip + 300ms echo window on the .interrupted server event).
+
         let inputFormat = inputNode.inputFormat(forBus: 0)
         print("[OpenAIRealtimeSession] Mic input format: \(inputFormat)")
 
@@ -387,6 +545,17 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
                           userInfo: [NSLocalizedDescriptionKey: "Microphone has zero sample rate — likely no input device available"])
         }
 
+        installMicTap(inputNode: inputNode, inputFormat: inputFormat)
+
+        audioEngine.prepare()
+        try audioEngine.start()
+        print("[OpenAIRealtimeSession] Mic capture started")
+    }
+
+    /// Install the mic tap on the given input node. Factored out so
+    /// `resumeMicTapAfterNarration` can reuse it without touching the
+    /// rest of the engine lifecycle.
+    private func installMicTap(inputNode: AVAudioInputNode, inputFormat: AVAudioFormat) {
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
 
@@ -394,18 +563,23 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
             let modelSpeaking = self.modelSpeakingLock.withLock { self.modelSpeakingFlag }
             if modelSpeaking { return }
 
-            // Compute audio power for waveform UI.
+            // Compute audio power for waveform UI. Guard against zero
+            // frameLength buffers — they can show up briefly during tap
+            // teardown / device-change moments and would otherwise
+            // produce NaN power levels (sumSquares / 0).
             if let channelData = buffer.floatChannelData {
                 let frameLength = Int(buffer.frameLength)
-                var sumSquares: Float = 0
-                for i in 0..<frameLength {
-                    let sample = channelData[0][i]
-                    sumSquares += sample * sample
-                }
-                let rms = sqrt(sumSquares / Float(frameLength))
-                let normalized = min(1.0, max(0.0, CGFloat(rms) * 4.0))
-                Task { @MainActor in
-                    self.currentAudioPowerLevel = normalized
+                if frameLength > 0 {
+                    var sumSquares: Float = 0
+                    for i in 0..<frameLength {
+                        let sample = channelData[0][i]
+                        sumSquares += sample * sample
+                    }
+                    let rms = sqrt(sumSquares / Float(frameLength))
+                    let normalized = min(1.0, max(0.0, CGFloat(rms) * 4.0))
+                    Task { @MainActor in
+                        self.currentAudioPowerLevel = normalized
+                    }
                 }
             }
 
@@ -413,13 +587,14 @@ final class OpenAIRealtimeSession: ObservableObject, VoiceBackend {
             self.openaiClient.sendAudioChunk(pcm16Data)
         }
         isAudioTapInstalled = true
-
-        audioEngine.prepare()
-        try audioEngine.start()
-        print("[OpenAIRealtimeSession] Mic capture started")
     }
 
     private func stopMicCapture() {
+        // Detach the player from this engine before tearing the engine
+        // down — once detached, the player will silently drop any
+        // late-arriving chunks until the next session attaches it again.
+        audioPlayer.detach()
+
         if isAudioTapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
             isAudioTapInstalled = false
