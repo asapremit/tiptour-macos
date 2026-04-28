@@ -188,10 +188,31 @@ final class OpenAIRealtimeClient: @unchecked Sendable {
                             "rate": Int(Self.inputSampleRate)
                         ],
                         "turn_detection": [
-                            // Server-side voice activity detection — same
-                            // pattern as Gemini's automatic VAD. Keeps the
-                            // mic always-listen behavior.
-                            "type": "server_vad"
+                            // Server-side voice activity detection.
+                            //  - threshold: 0.75 (default 0.5) — quieter
+                            //    audio doesn't count as speech. Cuts down
+                            //    on speaker-bleed false interrupts.
+                            //  - silence_duration_ms: 800 (default 500) —
+                            //    user has to be quiet for longer before
+                            //    the server declares end-of-turn. Stops
+                            //    the model from clipping users mid-pause.
+                            //  - prefix_padding_ms: 300 — small leading
+                            //    buffer attached to detected speech so
+                            //    the first phoneme isn't truncated.
+                            // All three together make the VAD substantially
+                            // less twitchy on speakerphone setups, which is
+                            // OpenAI's documented recommendation.
+                            "type": "server_vad",
+                            "threshold": 0.75,
+                            "silence_duration_ms": 800,
+                            "prefix_padding_ms": 300
+                        ],
+                        // Optimize the server-side audio pipeline for
+                        // speakerphone scenarios. Reduces the chance that
+                        // ambient room reverb and far-field speaker bleed
+                        // get treated as user speech by the model.
+                        "noise_reduction": [
+                            "type": "far_field"
                         ],
                         "transcription": [
                             // Have the server transcribe the user's speech
@@ -294,7 +315,18 @@ final class OpenAIRealtimeClient: @unchecked Sendable {
 
     /// Reply to a tool call so the model can continue its turn. `output`
     /// is serialized as JSON inside the function_call_output item.
-    func sendToolResponse(callID: String, output: [String: Any]) {
+    /// Optionally takes per-response `instructions` that ride along with
+    /// the follow-up `response.create` — these override the session-level
+    /// instructions for just this one response, which is OpenAI's
+    /// documented mechanism to bias the model's behavior on a single
+    /// turn. We use this to nudge the model into actually narrating
+    /// what it just did (gpt-realtime-1.5 sometimes goes silent after a
+    /// tool fires; explicit per-response instructions fix that).
+    func sendToolResponse(
+        callID: String,
+        output: [String: Any],
+        followUpInstructions: String? = nil
+    ) {
         guard isConnected else { return }
         let outputJSON: String
         if let data = try? JSONSerialization.data(withJSONObject: output),
@@ -312,8 +344,17 @@ final class OpenAIRealtimeClient: @unchecked Sendable {
             ]
         ]
         sendJSONFireAndForget(event)
-        // After a tool response, prompt the model to continue speaking.
-        sendJSONFireAndForget(["type": "response.create"])
+
+        // Trigger the follow-up response. If we have specific
+        // narration instructions, attach them via `response.instructions`
+        // so the model speaks instead of going silent.
+        var responseCreateEvent: [String: Any] = ["type": "response.create"]
+        if let followUpInstructions, !followUpInstructions.isEmpty {
+            responseCreateEvent["response"] = [
+                "instructions": followUpInstructions
+            ]
+        }
+        sendJSONFireAndForget(responseCreateEvent)
     }
 
     // MARK: - Send Helpers

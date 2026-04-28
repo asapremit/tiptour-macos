@@ -248,9 +248,10 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
 
         try startMicCapture()
 
-        // Prepare the audio output engine so there's no startup delay
-        // on the first audio chunk Gemini sends back.
-        audioPlayer.startEngine()
+        // The player is now attached to the same engine that startMicCapture
+        // just started. Prime the player node so the first audio chunk
+        // plays back without scheduling latency.
+        audioPlayer.startPlaying()
 
         isActive = true
         inputTranscript = ""
@@ -267,7 +268,9 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
 
         stopPeriodicScreenshotUpdates()
         stopMicCapture()
-        audioPlayer.stopAndClearQueue()
+        // Player detach happened inside stopMicCapture; clear any
+        // residual buffered audio so it doesn't replay on next session.
+        audioPlayer.clearQueuedAudio()
         geminiClient.disconnect()
 
         isActive = false
@@ -309,9 +312,13 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
         guard isActive else { return }
         guard !isInNarrationMode else { return }
         stopPeriodicScreenshotUpdates()
-        stopMicCapture()
+        // Pause ONLY the mic tap. Engine + attached player keep running
+        // so the model's narration audio still plays. Calling
+        // stopMicCapture() here detached the player and dropped every
+        // narration audio chunk on the floor.
+        pauseMicTapForNarration()
         isInNarrationMode = true
-        print("[GeminiLiveSession] Narration mode entered (mic + screenshots paused)")
+        print("[GeminiLiveSession] Narration mode entered (mic paused, audio playback alive)")
     }
 
     /// Mark that a tool call was just satisfied, so subsequent
@@ -345,13 +352,40 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
         guard isActive else { return }
         guard isInNarrationMode else { return }
         do {
-            try startMicCapture()
+            try resumeMicTapAfterNarration()
         } catch {
-            print("[GeminiLiveSession] Failed to restart mic after narration: \(error)")
+            print("[GeminiLiveSession] Failed to resume mic after narration: \(error)")
         }
         startPeriodicScreenshotUpdates()
         isInNarrationMode = false
-        print("[GeminiLiveSession] Narration mode exited (mic + screenshots resumed)")
+        print("[GeminiLiveSession] Narration mode exited (mic resumed)")
+    }
+
+    /// Remove ONLY the mic tap, leaving the engine + attached player
+    /// running so the model's narration audio still plays back.
+    private func pauseMicTapForNarration() {
+        if isAudioTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            isAudioTapInstalled = false
+        }
+        currentAudioPowerLevel = 0
+    }
+
+    /// Re-install the mic tap on the still-running engine. Doesn't touch
+    /// the engine lifecycle or the player attachment.
+    private func resumeMicTapAfterNarration() throws {
+        guard !isAudioTapInstalled else { return }
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.inputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw NSError(domain: "GeminiLiveSession", code: -21,
+                          userInfo: [NSLocalizedDescriptionKey: "Mic format invalid on resume — sample rate \(inputFormat.sampleRate)"])
+        }
+        installMicTap(inputNode: inputNode, inputFormat: inputFormat)
+        if !audioEngine.isRunning {
+            audioEngine.prepare()
+            try audioEngine.start()
+        }
     }
 
     /// Send a text input to Gemini — kept around for future use (e.g.
@@ -588,7 +622,19 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
         audioEngine = AVAudioEngine()
         isAudioTapInstalled = false
 
+        // Attach the model-audio player to this same engine BEFORE
+        // enabling voice processing. AUVoiceIO is full-duplex — both
+        // mic uplink and speaker downlink have to share an engine so
+        // the AEC has a valid reference signal to subtract.
+        audioPlayer.attach(to: audioEngine)
+
         let inputNode = audioEngine.inputNode
+
+        // AUVoiceIO was tried here for hardware AEC but breaks audio
+        // playback on macOS configurations with aggregate input devices
+        // or virtual mics (`failed to run downlink DSP (state fault)`).
+        // We rely on the session-level software echo guards instead.
+
         // Query the format fresh from the hardware AT THIS MOMENT.
         let inputFormat = inputNode.inputFormat(forBus: 0)
 
@@ -601,6 +647,17 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
         }
         print("[GeminiLiveSession] Mic input format: \(inputFormat)")
 
+        installMicTap(inputNode: inputNode, inputFormat: inputFormat)
+
+        audioEngine.prepare()
+        try audioEngine.start()
+        print("[GeminiLiveSession] Mic capture started")
+    }
+
+    /// Install the mic tap on the given input node. Factored out so
+    /// `resumeMicTapAfterNarration` can reuse it without rebuilding the
+    /// engine or detaching the player.
+    private func installMicTap(inputNode: AVAudioInputNode, inputFormat: AVAudioFormat) {
         // CRITICAL: this callback runs on a real-time audio thread ~40x/sec.
         // Never block it and never hop to the main actor from inside — both
         // will starve Core Audio and cause Gemini's voice to stutter.
@@ -631,13 +688,14 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
             }
         }
         isAudioTapInstalled = true
-
-        audioEngine.prepare()
-        try audioEngine.start()
-        print("[GeminiLiveSession] Mic capture started")
     }
 
     private func stopMicCapture() {
+        // Detach the player from this engine before tearing the engine
+        // down. The next session re-attaches to a fresh engine in
+        // startMicCapture.
+        audioPlayer.detach()
+
         if isAudioTapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
             isAudioTapInstalled = false
@@ -774,7 +832,7 @@ final class GeminiLiveSession: ObservableObject, VoiceBackend {
                 lastSentScreenshotHashByScreenLabel.removeAll()
                 await captureAndProcessFrameForGemini()
                 try startMicCapture()
-                audioPlayer.startEngine()
+                audioPlayer.startPlaying()
                 startPeriodicScreenshotUpdates()
                 reconnectAttemptIndex = 0
                 print("[GeminiLiveSession] ✅ reconnected successfully")
