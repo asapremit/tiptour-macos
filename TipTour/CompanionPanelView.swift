@@ -46,6 +46,10 @@ struct CompanionPanelView: View {
 
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer().frame(height: 14)
+                voiceModelRow
+                    .padding(.horizontal, 16)
+
+                Spacer().frame(height: 4)
                 nekoModeToggleRow
                     .padding(.horizontal, 16)
             }
@@ -432,6 +436,70 @@ struct CompanionPanelView: View {
 
     // MARK: - Neko Mode Toggle
 
+    /// Top-level voice-backend selector. Visual weight matches the neko
+    /// row so they read as siblings — both are real user preferences.
+    /// Hot-swaps the active backend the moment the user picks; any
+    /// in-flight session on the previous backend is stopped first.
+    private var voiceModelRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: "waveform.badge.mic")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.accent)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Voice model")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text(companionManager.voiceBackendKind.displayName)
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+            }
+
+            Spacer()
+
+            Menu {
+                ForEach(VoiceBackendKind.allCases) { kind in
+                    Button {
+                        companionManager.setVoiceBackendKind(kind)
+                    } label: {
+                        if companionManager.voiceBackendKind == kind {
+                            Label(kind.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(kind.displayName)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(companionManager.voiceBackendKind.displayName)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .pointerCursor()
+        }
+        .padding(.vertical, 4)
+    }
+
     /// Whimsical toggle that swaps the blue triangle cursor for a
     /// pixel-art cat (classic oneko sprites).
     private var nekoModeToggleRow: some View {
@@ -707,11 +775,13 @@ struct CompanionPanelView: View {
             HStack(spacing: 0) {
                 feedbackButton
 
-                #if DEBUG
+                // Always-visible Dev button — gives shipped users access to
+                // the voice-backend picker and BYOK key inputs. The truly
+                // debug-only rows (Detection Overlay, Test Cursor Flight,
+                // Reset All) stay #if DEBUG-gated inside the section.
                 footerButton("Dev", systemImage: "wrench", toggled: showDevTools) {
                     showDevTools.toggle()
                 }
-                #endif
 
                 Spacer()
 
@@ -720,12 +790,10 @@ struct CompanionPanelView: View {
                 }
             }
 
-            #if DEBUG
             if showDevTools {
                 devToolsSection
                     .padding(.top, 8)
             }
-            #endif
         }
     }
 
@@ -751,73 +819,106 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
-    // MARK: - Dev Tools (DEBUG only)
+    // MARK: - Dev Tools
 
-    #if DEBUG
+    /// Always-visible. Shipping users get the voice-backend picker and
+    /// bring-your-own-key fields here so they can switch models or wire
+    /// in their own OpenAI / Gemini key without rebuilding from source.
+    /// The detection-overlay / cursor-flight / reset-all rows below are
+    /// still gated by `#if DEBUG` because they're internal-only and
+    /// have no use to a casual user.
     @State private var showDevTools: Bool = false
     @State private var devGeminiKeyInput: String = ""
     @State private var devGeminiKeyStatus: String = ""
     @State private var devOpenAIKeyInput: String = ""
     @State private var devOpenAIKeyStatus: String = ""
 
-    /// Compact bring-your-own-key row used inside the Dev tools section
-    /// for both Gemini and OpenAI keys. SecureField + Save / Clear, no
-    /// inline explanation copy — the section is DEBUG-only and the user
-    /// already knows what these keys are for.
+    /// One-line bring-your-own-key row. Icon + label on the left, a
+    /// SecureField that grows to fill, and a single trailing icon button
+    /// that toggles between Save (when there's input) and Clear (when a
+    /// key is already saved). Status flashes briefly after either action.
     private func byokKeyRow(
         title: String,
         placeholder: String,
         input: Binding<String>,
-        load: @escaping () -> Void,
         save: @escaping () -> Void,
         clear: @escaping () -> Void,
-        status: Binding<String>
+        status: Binding<String>,
+        hasSavedKey: Bool
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: "key")
-                    .font(.system(size: 11))
-                    .foregroundColor(DS.Colors.textTertiary)
-                    .frame(width: 16)
-                Text(title)
-                    .font(.system(size: 12))
-                    .foregroundColor(DS.Colors.textSecondary)
-                Spacer()
-                Text(status.wrappedValue)
-                    .font(.system(size: 10))
-                    .foregroundColor(DS.Colors.textTertiary)
-            }
-            .padding(.horizontal, 10)
+        let trimmedInput = input.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let saveDisabled = trimmedInput.isEmpty
+        return HStack(spacing: 8) {
+            Image(systemName: "key")
+                .font(.system(size: 10))
+                .foregroundColor(hasSavedKey ? DS.Colors.accent : DS.Colors.textTertiary)
+                .frame(width: 16)
 
-            HStack(spacing: 6) {
-                SecureField(placeholder, text: input)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11, design: .monospaced))
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textSecondary)
+                .frame(width: 70, alignment: .leading)
 
-                Button("Save") {
-                    save()
+            SecureField(placeholder, text: input)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(DS.Colors.textPrimary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.white.opacity(0.05))
+                )
+
+            Button {
+                save()
+                status.wrappedValue = "Saved"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if status.wrappedValue == "Saved" { status.wrappedValue = "" }
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .pointerCursor()
-                .disabled(input.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                Button("Clear") {
-                    clear()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .pointerCursor()
+            } label: {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(saveDisabled ? DS.Colors.textTertiary : .white)
+                    .frame(width: 22, height: 20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(saveDisabled ? Color.white.opacity(0.06) : DS.Colors.accent)
+                    )
             }
-            .padding(.horizontal, 10)
-            .padding(.bottom, 4)
-            .onAppear { load() }
+            .buttonStyle(.plain)
+            .disabled(saveDisabled)
+            .pointerCursor()
+            .help("Save")
+
+            Button {
+                clear()
+                status.wrappedValue = "Cleared"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if status.wrappedValue == "Cleared" { status.wrappedValue = "" }
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 22, height: 20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .help("Clear")
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
     }
 
     private var devToolsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            voiceBackendPicker
+            #if DEBUG
+            sectionHeader("DEBUG")
 
             devToolRow("Detection Overlay", systemImage: "square.grid.3x3") {
                 companionManager.showDetectionOverlay.toggle()
@@ -840,63 +941,72 @@ struct CompanionPanelView: View {
                 NotificationCenter.default.post(name: .tipTourDismissPanel, object: nil)
             }
 
-            devToolRow("Reset All", systemImage: "xmark.circle", destructive: true) {
-                companionManager.clearDetectedElementLocation()
-                companionManager.onboardingPromptText = ""
-                companionManager.onboardingPromptOpacity = 0.0
-                companionManager.showOnboardingPrompt = false
-            }
+            Spacer().frame(height: 6)
+            #endif
+
+            sectionHeader("API KEYS (optional)")
 
             byokKeyRow(
-                title: "Gemini key",
+                title: "Gemini",
                 placeholder: "AIzaSy…",
                 input: $devGeminiKeyInput,
-                load: { devGeminiKeyInput = KeychainStore.geminiAPIKey ?? "" },
                 save: {
                     KeychainStore.geminiAPIKey = devGeminiKeyInput
-                    devGeminiKeyStatus = "Saved"
                 },
                 clear: {
                     devGeminiKeyInput = ""
                     KeychainStore.geminiAPIKey = nil
-                    devGeminiKeyStatus = "Cleared"
                 },
-                status: $devGeminiKeyStatus
+                status: $devGeminiKeyStatus,
+                hasSavedKey: !(KeychainStore.geminiAPIKey ?? "").isEmpty
             )
 
             byokKeyRow(
-                title: "OpenAI key",
+                title: "OpenAI",
                 placeholder: "sk-…",
                 input: $devOpenAIKeyInput,
-                load: { devOpenAIKeyInput = KeychainStore.openAIAPIKey ?? "" },
                 save: {
                     KeychainStore.openAIAPIKey = devOpenAIKeyInput
-                    devOpenAIKeyStatus = "Saved"
                 },
                 clear: {
                     devOpenAIKeyInput = ""
                     KeychainStore.openAIAPIKey = nil
-                    devOpenAIKeyStatus = "Cleared"
                 },
-                status: $devOpenAIKeyStatus
+                status: $devOpenAIKeyStatus,
+                hasSavedKey: !(KeychainStore.openAIAPIKey ?? "").isEmpty
             )
+
+            // Combined save/clear status text — only the most recent
+            // action's status is shown, then auto-clears after a beat.
+            let activeStatus = devOpenAIKeyStatus.isEmpty ? devGeminiKeyStatus : devOpenAIKeyStatus
+            if !activeStatus.isEmpty {
+                Text(activeStatus)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 4)
+                    .transition(.opacity)
+            }
         }
         .onAppear {
             // Pre-populate the fields from Keychain so the user can see
             // whether a key is already saved (revealed as dots in the
-            // SecureField). Cheap on-show; ignored if the key isn't set.
+            // SecureField).
             devGeminiKeyInput = KeychainStore.geminiAPIKey ?? ""
             devOpenAIKeyInput = KeychainStore.openAIAPIKey ?? ""
         }
         .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(DS.Colors.surface1)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                )
-        )
+    }
+
+    /// Compact uppercase section label used inside the Dev panel.
+    private func sectionHeader(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .semibold, design: .rounded))
+            .tracking(0.4)
+            .foregroundColor(DS.Colors.textTertiary)
+            .padding(.horizontal, 10)
+            .padding(.top, 6)
+            .padding(.bottom, 3)
     }
 
     private func devToolRow(
@@ -930,60 +1040,6 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
-    /// Two-option segmented picker for the active voice backend
-    /// (Gemini Live vs OpenAI Realtime). Hot-swaps the backend the
-    /// moment the user picks; any in-flight session on the previous
-    /// backend is stopped first.
-    private var voiceBackendPicker: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "waveform.badge.mic")
-                .font(.system(size: 11))
-                .foregroundColor(DS.Colors.textTertiary)
-                .frame(width: 16)
-
-            Text("Voice")
-                .font(.system(size: 12))
-                .foregroundColor(DS.Colors.textSecondary)
-
-            Spacer()
-
-            HStack(spacing: 0) {
-                ForEach(VoiceBackendKind.allCases) { kind in
-                    voiceBackendOption(kind)
-                }
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-    }
-
-    private func voiceBackendOption(_ kind: VoiceBackendKind) -> some View {
-        let isSelected = companionManager.voiceBackendKind == kind
-        return Button(action: {
-            companionManager.setVoiceBackendKind(kind)
-        }) {
-            Text(kind.displayName)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(isSelected ? Color.white.opacity(0.10) : Color.clear)
-                )
-        }
-        .buttonStyle(.plain)
-        .pointerCursor()
-    }
-
     private struct DevToolRowButtonStyle: ButtonStyle {
         @State private var isHovered = false
 
@@ -998,7 +1054,6 @@ struct CompanionPanelView: View {
                 .onHover { isHovered = $0 }
         }
     }
-    #endif
 
     // MARK: - Visuals
 
