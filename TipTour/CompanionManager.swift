@@ -78,78 +78,26 @@ final class CompanionManager: ObservableObject {
         hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
     }
 
-    /// Which realtime backend the user has selected. Gemini Live by default;
-    /// flipping this to `.openaiRealtime` makes `voiceBackend` rebuild the
-    /// session against OpenAI's gpt-realtime-1.5. Persisted across launches.
-    @Published private(set) var voiceBackendKind: VoiceBackendKind = {
-        if let raw = UserDefaults.standard.string(forKey: VoiceBackendKind.userDefaultsKey),
-           let kind = VoiceBackendKind(rawValue: raw) {
-            return kind
-        }
-        // Gemini Live is the default for new installs. It's measurably
-        // better at TipTour's actual use case (multi-step UI walkthroughs
-        // with on-screen pointing) because it's natively trained on the
-        // box_2d spatial-grounding format and produces more reliable
-        // post-tool narration. OpenAI Realtime stays available via the
-        // picker for users who prefer its voice or general-chat strengths.
-        // Existing installs keep whatever the user previously chose.
-        return .geminiLive
-    }()
+    /// Backing storage for the active voice session. Built lazily on first
+    /// access via `voiceBackend`. Single backend now — Gemini Live.
+    private var _voiceBackend: GeminiLiveSession?
 
-    /// Backing storage for the active voice backend. Built lazily on first
-    /// access via `voiceBackend`; reset to nil by `setVoiceBackendKind` so
-    /// the next access constructs the new kind. Either GeminiLiveSession or
-    /// OpenAIRealtimeSession at runtime — both conform to VoiceBackend.
-    private var _voiceBackend: (any VoiceBackend)?
-
-    /// The active voice backend. Constructs the right concrete kind on
+    /// The active voice session. Constructs the Gemini Live session on
     /// first access and wires all the tool / transcript callbacks once.
-    /// Subsequent accesses return the cached instance until the user flips
-    /// `voiceBackendKind`.
-    var voiceBackend: any VoiceBackend {
+    var voiceBackend: GeminiLiveSession {
         if let existing = _voiceBackend { return existing }
-        let backend = makeVoiceBackend(for: voiceBackendKind)
+        let backend = GeminiLiveSession(
+            apiKeyURL: "\(Self.workerBaseURL)/gemini-live-key",
+            systemPrompt: Self.companionVoiceResponseSystemPrompt
+        )
+        wireCallbacks(on: backend)
         _voiceBackend = backend
         rebindVoiceBackendPublishers(backend)
         return backend
     }
 
-    /// Switch the active backend kind. Stops any in-flight session on the
-    /// previous backend, drops it, and persists the user's choice. The
-    /// next push-to-talk press will build + use the new kind.
-    func setVoiceBackendKind(_ kind: VoiceBackendKind) {
-        guard kind != voiceBackendKind else { return }
-        print("[CompanionManager] switching voice backend → \(kind.displayName)")
-        if let existing = _voiceBackend {
-            existing.stop()
-            _voiceBackend = nil
-        }
-        voiceBackendKind = kind
-        UserDefaults.standard.set(kind.rawValue, forKey: VoiceBackendKind.userDefaultsKey)
-        voiceState = .idle
-    }
-
-    private func makeVoiceBackend(for kind: VoiceBackendKind) -> any VoiceBackend {
-        let backend: any VoiceBackend
-        switch kind {
-        case .geminiLive:
-            backend = GeminiLiveSession(
-                apiKeyURL: "\(Self.workerBaseURL)/gemini-live-key",
-                systemPrompt: Self.companionVoiceResponseSystemPrompt
-            )
-        case .openaiRealtime:
-            backend = OpenAIRealtimeSession(
-                ephemeralTokenURL: "\(Self.workerBaseURL)/openai-realtime-token",
-                systemPrompt: Self.companionVoiceResponseSystemPrompt
-            )
-        }
-        wireCallbacks(on: backend)
-        return backend
-    }
-
-    /// Hook all tool / transcript / error callbacks. Identical wiring for
-    /// every backend kind — that's the whole point of the protocol.
-    private func wireCallbacks(on backend: any VoiceBackend) {
+    /// Hook all tool / transcript / error callbacks.
+    private func wireCallbacks(on backend: GeminiLiveSession) {
         backend.onPointAtElement = { [weak self] id, label, box2DNormalized, screenshotJPEG in
             await self?.handleToolPointAtElement(
                 id: id,
@@ -183,16 +131,14 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Subscribe to the new backend's audio-power and model-speaking
-    /// publishers. Old subscriptions are cancelled here implicitly by
-    /// reassignment of the `AnyCancellable` storage.
-    private func rebindVoiceBackendPublishers(_ backend: any VoiceBackend) {
-        voiceAudioPowerCancellable = backend.currentAudioPowerLevelPublisher
+    /// Subscribe to the backend's audio-power and model-speaking publishers.
+    private func rebindVoiceBackendPublishers(_ backend: GeminiLiveSession) {
+        voiceAudioPowerCancellable = backend.$currentAudioPowerLevel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] powerLevel in
                 self?.currentAudioPowerLevel = powerLevel
             }
-        voiceModelSpeakingCancellable = backend.isModelSpeakingPublisher
+        voiceModelSpeakingCancellable = backend.$isModelSpeaking
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isSpeaking in
                 guard let self = self, self.voiceBackend.isActive else { return }
@@ -567,8 +513,7 @@ final class CompanionManager: ObservableObject {
         startPermissionPolling()
         // Touch the lazy property so the backend is constructed and the
         // publishers are subscribed BEFORE the user opens the panel /
-        // presses the hotkey. Subsequent kind switches re-bind via
-        // setVoiceBackendKind → next access of `voiceBackend`.
+        // presses the hotkey.
         _ = voiceBackend
         bindShortcutTransitions()
         beginTrackingUserTargetApp()

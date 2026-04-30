@@ -105,13 +105,4 @@ enum KeychainStore {
         set { set(newValue ?? "", forKey: "geminiAPIKey") }
     }
 
-    /// OpenAI API key for bring-your-own-key mode. When present,
-    /// OpenAIRealtimeSession mints its own ephemeral via OpenAI's
-    /// `/v1/realtime/client_secrets` endpoint instead of going through
-    /// the Worker — useful for local source builds where the Worker
-    /// might not have the production OPENAI_API_KEY secret set.
-    static var openAIAPIKey: String? {
-        get { get(forKey: "openAIAPIKey") }
-        set { set(newValue ?? "", forKey: "openAIAPIKey") }
-    }
 }

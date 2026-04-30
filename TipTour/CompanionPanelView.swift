@@ -46,7 +46,6 @@ struct CompanionPanelView: View {
 
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer().frame(height: 14)
-                voiceModelRow
                     .padding(.horizontal, 16)
 
                 Spacer().frame(height: 4)
@@ -436,70 +435,6 @@ struct CompanionPanelView: View {
 
     // MARK: - Neko Mode Toggle
 
-    /// Top-level voice-backend selector. Visual weight matches the neko
-    /// row so they read as siblings — both are real user preferences.
-    /// Hot-swaps the active backend the moment the user picks; any
-    /// in-flight session on the previous backend is stopped first.
-    private var voiceModelRow: some View {
-        HStack {
-            HStack(spacing: 8) {
-                Image(systemName: "waveform.badge.mic")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(DS.Colors.accent)
-                    .frame(width: 16)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Voice model")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(DS.Colors.textSecondary)
-                    Text(companionManager.voiceBackendKind.displayName)
-                        .font(.system(size: 10))
-                        .foregroundColor(DS.Colors.textTertiary)
-                }
-            }
-
-            Spacer()
-
-            Menu {
-                ForEach(VoiceBackendKind.allCases) { kind in
-                    Button {
-                        companionManager.setVoiceBackendKind(kind)
-                    } label: {
-                        if companionManager.voiceBackendKind == kind {
-                            Label(kind.displayName, systemImage: "checkmark")
-                        } else {
-                            Text(kind.displayName)
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Text(companionManager.voiceBackendKind.displayName)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.textPrimary)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundColor(DS.Colors.textTertiary)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(Color.white.opacity(0.06))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                )
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .pointerCursor()
-        }
-        .padding(.vertical, 4)
-    }
-
     /// Whimsical toggle that swaps the blue triangle cursor for a
     /// pixel-art cat (classic oneko sprites).
     private var nekoModeToggleRow: some View {
@@ -830,8 +765,6 @@ struct CompanionPanelView: View {
     @State private var showDevTools: Bool = false
     @State private var devGeminiKeyInput: String = ""
     @State private var devGeminiKeyStatus: String = ""
-    @State private var devOpenAIKeyInput: String = ""
-    @State private var devOpenAIKeyStatus: String = ""
 
     /// One-line bring-your-own-key row. Icon + label on the left, a
     /// SecureField that grows to fill, and a single trailing icon button
@@ -961,26 +894,9 @@ struct CompanionPanelView: View {
                 hasSavedKey: !(KeychainStore.geminiAPIKey ?? "").isEmpty
             )
 
-            byokKeyRow(
-                title: "OpenAI",
-                placeholder: "sk-…",
-                input: $devOpenAIKeyInput,
-                save: {
-                    KeychainStore.openAIAPIKey = devOpenAIKeyInput
-                },
-                clear: {
-                    devOpenAIKeyInput = ""
-                    KeychainStore.openAIAPIKey = nil
-                },
-                status: $devOpenAIKeyStatus,
-                hasSavedKey: !(KeychainStore.openAIAPIKey ?? "").isEmpty
-            )
-
-            // Combined save/clear status text — only the most recent
-            // action's status is shown, then auto-clears after a beat.
-            let activeStatus = devOpenAIKeyStatus.isEmpty ? devGeminiKeyStatus : devOpenAIKeyStatus
-            if !activeStatus.isEmpty {
-                Text(activeStatus)
+            // Save/clear status text — auto-clears after a beat.
+            if !devGeminiKeyStatus.isEmpty {
+                Text(devGeminiKeyStatus)
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textTertiary)
                     .padding(.horizontal, 10)
@@ -989,11 +905,10 @@ struct CompanionPanelView: View {
             }
         }
         .onAppear {
-            // Pre-populate the fields from Keychain so the user can see
+            // Pre-populate the field from Keychain so the user can see
             // whether a key is already saved (revealed as dots in the
             // SecureField).
             devGeminiKeyInput = KeychainStore.geminiAPIKey ?? ""
-            devOpenAIKeyInput = KeychainStore.openAIAPIKey ?? ""
         }
         .padding(.vertical, 4)
     }

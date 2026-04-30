@@ -18,24 +18,7 @@ import Combine
 import Foundation
 
 @MainActor
-final class GeminiLiveSession: ObservableObject, VoiceBackend {
-
-    // MARK: - VoiceBackend Publisher Conformance
-
-    /// Type-erased projections of the `@Published` state above so
-    /// CompanionManager can subscribe through the protocol without
-    /// pinning to the concrete type. Identical signal as `$x` —
-    /// just sliced behind a uniform interface. The accessors stay on
-    /// the MainActor because `@Published`'s projected value is itself
-    /// MainActor-isolated; the subscriber receives values on its own
-    /// queue via `.receive(on:)` like before.
-    var currentAudioPowerLevelPublisher: AnyPublisher<CGFloat, Never> {
-        $currentAudioPowerLevel.eraseToAnyPublisher()
-    }
-    var isModelSpeakingPublisher: AnyPublisher<Bool, Never> {
-        $isModelSpeaking.eraseToAnyPublisher()
-    }
-
+final class GeminiLiveSession: ObservableObject {
 
     // MARK: - Published State (bindable from SwiftUI)
 
