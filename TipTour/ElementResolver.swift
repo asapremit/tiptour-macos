@@ -191,13 +191,25 @@ final class ElementResolver: @unchecked Sendable {
         return nil
     }
 
-    /// Full resolution pipeline: AX → YOLO → LLM coords, tried in order
-    /// with early exit. YOLO detection runs concurrently with the AX
-    /// walk so its result is already waiting if AX misses — the user-
-    /// visible latency for AX-miss cases drops from (axTime + yoloTime)
-    /// to max(axTime, yoloTime). When AX hits, we return immediately
-    /// and let the YOLO task finish in the background (it populates the
-    /// cache for a future call).
+    /// Full resolution pipeline: AX → box_2d → YOLO+OCR, tried in order
+    /// with early exit.
+    ///
+    /// Tier order is deliberate: when Gemini emits box_2d alongside the
+    /// label, those coordinates ARE the model's spatial intent. They
+    /// reflect everything Gemini knew about the image at tool-call time
+    /// — semantic understanding, disambiguation between same-text
+    /// elements, and pixel grounding from a model trained natively on
+    /// box_2d output. YOLO+OCR is a smaller local model with no semantic
+    /// context; if box_2d is present, trusting it produces a strictly
+    /// better answer than re-finding the label via fuzzy text-match.
+    ///
+    /// YOLO+OCR remains valuable as a last-resort label search when AX
+    /// misses AND the model didn't emit box_2d (the rare case where the
+    /// LLM names an element but doesn't localize it).
+    ///
+    /// We still kick off a parallel detection pass when the app is
+    /// known to lack an AX tree, so the cache is warm if the resolver
+    /// falls all the way through.
     func resolve(
         label: String,
         llmHintInScreenshotPixels: CGPoint?,
@@ -282,14 +294,30 @@ final class ElementResolver: @unchecked Sendable {
             return nil
         }
 
-        // 2. If we didn't pre-launch detection (AX-supported app) but AX
-        //    still missed, run it now. Detached at `.background` priority
-        //    so Core Audio preempts the CoreML pass — otherwise sustained
-        //    YOLO inference can push HALC_ProxyIOContext into "skipping
-        //    cycle due to overload" and we hear breaks in Gemini's voice
-        //    playback. Detection ends up ~10-20% slower but the user
-        //    can't hear the difference; they can definitely hear audio
-        //    stutter.
+        // 2. Trust the model's box_2d when it gave us one. This is Gemini's
+        //    spatial output for the same query that emitted the label —
+        //    one model, one decision, no second-guessing it with a
+        //    smaller text-fuzzy-matcher. Avoids the failure mode where
+        //    YOLO+OCR confidently snaps the cursor to a different
+        //    element whose OCR'd text fuzzy-matches the model's
+        //    placeholder label (e.g. "Add Button" → "Add...." somewhere
+        //    on screen unrelated to where Gemini was actually pointing).
+        if let hint = llmHintInScreenshotPixels {
+            return rawLLMCoordinate(
+                label: label,
+                llmHintInScreenshotPixels: hint,
+                capture: capture
+            )
+        }
+
+        // 3. No box_2d emitted — fall back to YOLO+OCR label search as a
+        //    last resort. This path only runs when AX missed AND the
+        //    model emitted just a label without localizing it. Run the
+        //    detection now if a parallel preload wasn't kicked off.
+        //    Detached at `.background` priority so Core Audio preempts
+        //    the CoreML pass — otherwise sustained YOLO inference can
+        //    push HALC_ProxyIOContext into "skipping cycle due to
+        //    overload" and we hear breaks in Gemini's voice playback.
         if let detectionTask {
             await detectionTask.value
         } else if runDetectorOnMiss,
@@ -299,28 +327,13 @@ final class ElementResolver: @unchecked Sendable {
             }.value
         }
 
-        // 3. YOLO label-only or hint-refined match. The proximity
-        //    anchor (previous step's resolved screen point) lets the
-        //    detector tie-break between multiple equal label matches
-        //    in favor of the one closest to where we just clicked —
-        //    fixes nested-menu ambiguity (e.g. "New" in an open File
-        //    menu vs "New Tab" elsewhere on screen).
         if let yoloResolution = await tryYOLO(
             label: label,
-            llmHintInScreenshotPixels: llmHintInScreenshotPixels,
+            llmHintInScreenshotPixels: nil,
             capture: capture,
             proximityAnchorInGlobalScreen: proximityAnchorInGlobalScreen
         ) {
             return yoloResolution
-        }
-
-        // 4. Raw LLM coordinates as last resort.
-        if let hint = llmHintInScreenshotPixels {
-            return rawLLMCoordinate(
-                label: label,
-                llmHintInScreenshotPixels: hint,
-                capture: capture
-            )
         }
 
         print("[ElementResolver] ✗ could not resolve \"\(label)\" — all strategies missed")
