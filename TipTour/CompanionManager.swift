@@ -110,17 +110,12 @@ final class CompanionManager: ObservableObject {
         backend.onSubmitWorkflowPlan = { [weak self] id, goal, app, steps in
             await self?.handleToolSubmitWorkflowPlan(id: id, goal: goal, app: app, steps: steps) ?? ["ok": false]
         }
-        backend.onOutputTranscript = { [weak self] fullTranscript in
-            self?.handleVoiceTranscriptUpdate(fullTranscript)
-        }
         backend.onInputTranscriptUpdate = { [weak self] fullInputTranscript in
             guard let self else { return }
             let isNewUtterance = fullInputTranscript.trimmingCharacters(in: .whitespacesAndNewlines).count > 0
                 && self.previousInputTranscriptLength == 0
             if isNewUtterance {
                 self.handledToolCallIDsThisUtterance.removeAll()
-                self.planAppliedThisTurn = false
-                self.lastVoiceTranscriptLength = 0
             }
             self.previousInputTranscriptLength = fullInputTranscript.count
         }
@@ -220,7 +215,6 @@ final class CompanionManager: ObservableObject {
             print("[Tool] 🔧 point_at_element(label=\"\(label)\")")
         }
         let startedAt = Date()
-        planAppliedThisTurn = true
         let resolution = await ElementResolver.shared.resolve(
             label: label,
             llmHintInScreenshotPixels: hintInScreenshotPixels,
@@ -276,7 +270,6 @@ final class CompanionManager: ObservableObject {
         }
 
         print("[Tool] 🔧 submit_workflow_plan(goal=\"\(goal)\", app=\"\(app)\", \(steps.count) steps)")
-        planAppliedThisTurn = true
 
         let captureForBoxConversion = voiceBackend.latestCapture
         let parsedSteps: [WorkflowStep] = steps.enumerated().map { index, raw in
@@ -392,7 +385,6 @@ final class CompanionManager: ObservableObject {
                 guard self.voiceBackend.isActive else { return }
                 print("[Workflow] narration window closed — exiting narration mode, session stays alive for follow-ups")
                 self.voiceBackend.exitNarrationMode()
-                self.planAppliedThisTurn = false
             }
         }
     }
@@ -400,10 +392,6 @@ final class CompanionManager: ObservableObject {
     /// Set of tool-call IDs we've already dispatched within the current
     /// user utterance. Reset when a new user utterance starts.
     private var handledToolCallIDsThisUtterance: Set<String> = []
-
-    /// Set when a tool call has already applied a pointing/plan this turn,
-    /// so the legacy [POINT:] transcript-tag fallback doesn't fight it.
-    private var planAppliedThisTurn: Bool = false
 
     /// Tracks input transcript length on the last update so we can detect
     /// "transcript went from empty → non-empty" — the reliable signal that
@@ -911,71 +899,6 @@ final class CompanionManager: ObservableObject {
       → speak your answer
     """
 
-    // MARK: - Point Tag Parsing
-
-    /// Result of parsing a [POINT:...] tag from a model response.
-    struct PointingParseResult {
-        let spokenText: String
-        let coordinate: CGPoint?
-        let elementLabel: String?
-        let screenNumber: Int?
-    }
-
-    /// Parses a [POINT:...] tag from the end of an LLM response.
-    /// Used as a fallback if Gemini emits transcript-tag pointing instead of
-    /// calling the proper tool.
-    static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
-        let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:]+?))?(?::screen(\d+))?|([^\]:\d][^\]:]*?)(?::screen(\d+))?)\]\s*$"#
-
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
-              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
-            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
-        }
-
-        let tagRange = Range(match.range, in: responseText)!
-        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Legacy x,y form.
-        if let xRange = Range(match.range(at: 1), in: responseText),
-           let yRange = Range(match.range(at: 2), in: responseText),
-           let x = Double(responseText[xRange]),
-           let y = Double(responseText[yRange]) {
-
-            var elementLabel: String? = nil
-            if let labelRange = Range(match.range(at: 3), in: responseText) {
-                elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
-            }
-            var screenNumber: Int? = nil
-            if let screenRange = Range(match.range(at: 4), in: responseText) {
-                screenNumber = Int(responseText[screenRange])
-            }
-
-            return PointingParseResult(
-                spokenText: spokenText,
-                coordinate: CGPoint(x: x, y: y),
-                elementLabel: elementLabel,
-                screenNumber: screenNumber
-            )
-        }
-
-        // Label-only form.
-        if let labelRange = Range(match.range(at: 5), in: responseText) {
-            let elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
-            var screenNumber: Int? = nil
-            if let screenRange = Range(match.range(at: 6), in: responseText) {
-                screenNumber = Int(responseText[screenRange])
-            }
-            return PointingParseResult(
-                spokenText: spokenText,
-                coordinate: nil,
-                elementLabel: elementLabel,
-                screenNumber: screenNumber
-            )
-        }
-
-        return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil)
-    }
-
     // MARK: - Image Conversion
 
     static func cgImage(from jpegData: Data) -> CGImage? {
@@ -984,42 +907,6 @@ final class CompanionManager: ObservableObject {
     }
 
     // MARK: - Gemini Live Mode
-
-    /// Track the last parsed transcript prefix so we only process new [POINT:] tags once.
-    private var lastVoiceTranscriptLength: Int = 0
-
-    /// Called whenever Gemini's output transcript grows — scans for [POINT:]
-    /// tags and triggers cursor pointing for each new one.
-    private func handleVoiceTranscriptUpdate(_ fullTranscript: String) {
-        guard fullTranscript.count > lastVoiceTranscriptLength else { return }
-        let newPortion = String(fullTranscript.suffix(fullTranscript.count - lastVoiceTranscriptLength))
-        lastVoiceTranscriptLength = fullTranscript.count
-
-        if planAppliedThisTurn { return }
-
-        let parseResult = Self.parsePointingCoordinates(from: newPortion)
-
-        guard let elementLabel = parseResult.elementLabel,
-              elementLabel.lowercased() != "none" else {
-            return
-        }
-
-        let hint = parseResult.coordinate
-        let capture = voiceBackend.latestCapture
-
-        Task {
-            guard let resolution = await ElementResolver.shared.resolve(
-                label: elementLabel,
-                llmHintInScreenshotPixels: hint,
-                latestCapture: capture
-            ) else {
-                return
-            }
-            await MainActor.run {
-                self.pointAtResolution(resolution)
-            }
-        }
-    }
 
     /// Execute a workflow plan emitted by Gemini.
     private func startWorkflowPlan(_ plan: WorkflowPlan) {
@@ -1042,8 +929,6 @@ final class CompanionManager: ObservableObject {
     /// and the AX tree are already hot — so the very first tool call resolves
     /// as accurately as every subsequent one.
     func startVoiceSession() {
-        lastVoiceTranscriptLength = 0
-
         Task.detached(priority: .userInitiated) {
             await Self.warmLocalResolvers()
         }
@@ -1070,7 +955,6 @@ final class CompanionManager: ObservableObject {
     /// End the Gemini Live session.
     func stopVoiceSession() {
         WorkflowRunner.shared.stop()
-        planAppliedThisTurn = false
         voiceBackend.stop()
     }
 }

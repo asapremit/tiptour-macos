@@ -55,16 +55,17 @@ final class ElementResolver: @unchecked Sendable {
 
     // MARK: - Resolution
 
-    /// Resolve a cursor target from an LLM pointing tag.
+    /// Resolve a cursor target from an LLM pointing tool call.
     ///
     /// - Parameters:
     ///   - label: the element's label (e.g. "Save", "File menu")
-    ///   - llmHintInScreenshotPixels: the LLM's (x,y) in screenshot pixel
-    ///     space. Optional — when using coordinate-free `[POINT:label]`
-    ///     tags this is nil and we rely entirely on AX + YOLO label matching.
+    ///   - llmHintInScreenshotPixels: the LLM's (x, y) in screenshot pixel
+    ///     space — typically derived from Gemini's `box_2d` field.
+    ///     Optional — when the model emits a label-only tool call this is
+    ///     nil and we rely on AX + YOLO+OCR label matching.
     ///   - latestCapture: the screenshot + metadata (display frame, pixel
     ///     dimensions) needed to convert screenshot pixels → global screen
-    ///     coordinates. Required for YOLO/LLM paths; not used by AX.
+    ///     coordinates. Required for box_2d / YOLO paths; not used by AX.
     /// Try AX tree only. Runs on a background task so the walk doesn't
     /// block main. Returns nil if AX has no match for the label.
     /// `targetAppHint` (e.g. "Blender") lets us query the app the user

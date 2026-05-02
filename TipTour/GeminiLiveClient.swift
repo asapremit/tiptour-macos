@@ -29,7 +29,10 @@ enum GeminiLiveEvent {
     /// Partial transcript of what the user said (ASR output)
     case inputTranscript(String)
 
-    /// Partial transcript of what the model said (for [POINT:] parsing)
+    /// Partial transcript of what the model said. Currently unused
+    /// downstream (legacy POINT-tag parser was removed); kept on the
+    /// wire so future tooling — debug overlays, transcript export —
+    /// can subscribe without changing the client.
     case outputTranscript(String)
 
     /// Model finished its turn — safe to send new user input

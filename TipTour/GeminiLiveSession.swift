@@ -8,8 +8,8 @@
 //       and streams it over the WebSocket
 //    3. Sends a screenshot at session start so Gemini can see the screen
 //    4. Plays back audio responses in real time via GeminiLiveAudioPlayer
-//    5. Exposes input/output transcripts and [POINT:] coordinates for
-//       the overlay to consume
+//    5. Routes Gemini's tool calls (point_at_element, submit_workflow_plan)
+//       to CompanionManager via callbacks
 //
 
 import AppKit
@@ -27,10 +27,6 @@ final class GeminiLiveSession: ObservableObject {
 
     /// Latest partial transcript of what the user is saying.
     @Published private(set) var inputTranscript: String = ""
-
-    /// Accumulated transcript of what the model has said this turn.
-    /// Used to parse [POINT:x,y:label] tags.
-    @Published private(set) var outputTranscript: String = ""
 
     /// Whether the model is currently speaking (audio is playing back).
     @Published private(set) var isModelSpeaking: Bool = false {
@@ -50,10 +46,6 @@ final class GeminiLiveSession: ObservableObject {
     @Published private(set) var currentAudioPowerLevel: CGFloat = 0.0
 
     // MARK: - Callbacks
-
-    /// Fires whenever new output transcript text arrives — the caller can
-    /// parse it for [POINT:] tags and trigger cursor pointing.
-    var onOutputTranscript: ((String) -> Void)?
 
     /// Fires whenever new input transcript text arrives (the user's speech
     /// as Gemini heard it). CompanionManager uses this to detect "a new
@@ -134,10 +126,11 @@ final class GeminiLiveSession: ObservableObject {
     private static let screenshotUpdateInterval: TimeInterval = 3.0
 
     /// The most recent screenshot sent to Gemini, with full metadata.
-    /// CompanionManager reads this when parsing [POINT:] tags so it maps
-    /// Gemini's coordinates (which are relative to this exact screenshot)
-    /// to the correct screen location. Without this the coordinates would
-    /// be off by the drift between "what Gemini saw" and "current screen".
+    /// CompanionManager reads this when handling tool calls so it can map
+    /// Gemini's box_2d coordinates (which are relative to this exact
+    /// screenshot) to the correct screen location. Without this the
+    /// coordinates would be off by the drift between "what Gemini saw"
+    /// and "current screen".
     @Published private(set) var latestCapture: CompanionScreenCapture?
 
     /// Last perceptual hash sent to Gemini, keyed by the screen label
@@ -238,7 +231,6 @@ final class GeminiLiveSession: ObservableObject {
 
         isActive = true
         inputTranscript = ""
-        outputTranscript = ""
 
         startPeriodicScreenshotUpdates()
 
@@ -421,10 +413,10 @@ final class GeminiLiveSession: ObservableObject {
     ///   2. Run YOLO+OCR detection on the same frame (populates cache)
     ///   3. Publish the CompanionScreenCapture as latestCapture
     ///
-    /// This is the key to accurate pointing: when Gemini later says
-    /// [POINT:x,y:label], the coordinates are relative to this exact
-    /// frame, and the detector cache already has the label's true
-    /// position in the same coordinate space.
+    /// This is the key to accurate pointing: when Gemini later emits
+    /// box_2d coordinates in a tool call, those coords are relative to
+    /// this exact frame, and the detector cache already has the label's
+    /// true position in the same coordinate space.
     private func startPeriodicScreenshotUpdates() {
         screenshotUpdateTimer?.invalidate()
         screenshotUpdateTimer = Timer.scheduledTimer(withTimeInterval: Self.screenshotUpdateInterval, repeats: true) { [weak self] _ in
@@ -732,16 +724,20 @@ final class GeminiLiveSession: ObservableObject {
                 print("[GeminiLiveSession] 🔊 user spoke — screenshots resumed")
             }
 
-        case .outputTranscript(let text):
-            outputTranscript += text
-            onOutputTranscript?(outputTranscript)
+        case .outputTranscript:
+            // Output transcript is only useful for debugging now that the
+            // legacy [POINT:] tag fallback is gone — Gemini's pointing
+            // intent comes through tool calls (point_at_element /
+            // submit_workflow_plan), not embedded markers in spoken text.
+            // Discard the chunk; the audio player handles user-facing
+            // narration directly.
+            break
 
         case .turnComplete:
             isModelSpeaking = false
             onTurnComplete?()
             // Reset transcripts so the next turn starts fresh.
             inputTranscript = ""
-            outputTranscript = ""
             toolCallsThisTurn = 0
 
         case .interrupted:
