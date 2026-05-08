@@ -16,7 +16,8 @@
 //  What this does NOT cover:
 //    Apps that render their own UI via OpenGL/Canvas (Blender, games,
 //    some Electron apps) have empty or incomplete AX trees. For those,
-//    the caller falls back to YOLO visual detection.
+//    the caller falls back to Gemini's box_2d coordinates from the
+//    same tool call.
 //
 
 import ApplicationServices
@@ -81,8 +82,8 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
     /// single accuracy lever for apps with good AX support.
     ///
     /// Returns nil when the target app has no AX tree (caller should
-    /// skip sending marks for those apps and let Gemini rely on vision
-    /// + YOLO fallback).
+    /// skip sending marks for those apps and let Gemini rely on its
+    /// own vision + box_2d output for coordinate grounding).
     func setOfMarksForTargetApp(hint: String?, maxElements: Int = 80) -> [ElementMark]? {
         guard Self.isPermissionGranted else { return nil }
         let (targetApp, _) = resolveTargetApp(hint: hint)
@@ -294,9 +295,9 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
     // these apps wastes ~2.7s per step AND burns CPU that Core Audio
     // needs to keep Gemini's voice smooth. Once we detect "this app has
     // an empty tree", we skip AX polling for subsequent steps in the
-    // same window of time and go straight to YOLO. Auto-expires after
-    // 10 minutes so re-installations or app updates that fix AX support
-    // don't stay blocklisted forever.
+    // same window of time and go straight to Gemini's box_2d output.
+    // Auto-expires after 10 minutes so re-installations or app updates
+    // that fix AX support don't stay blocklisted forever.
 
     private static let emptyTreeCacheLock = NSLock()
     nonisolated(unsafe) private static var emptyTreeHintTimestamps: [String: Date] = [:]
@@ -311,7 +312,7 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
         emptyTreeCacheLock.withLock {
             emptyTreeHintTimestamps[key] = Date()
         }
-        print("[AX] 🚫 flagging app \"\(hint)\" as no-AX-tree for 10min — future steps will skip straight to YOLO")
+        print("[AX] 🚫 flagging app \"\(hint)\" as no-AX-tree for 10min — future steps will skip straight to box_2d")
     }
 
     /// Check whether an app's AX tree is known to be empty. Callers
@@ -391,6 +392,15 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
         return (nil, nil)
     }
 
+    /// Public instance forwarder so callers outside this file (like
+    /// WorkflowRunner's modal-dialog detector and AX fingerprint
+    /// helper) can resolve a hint string to an NSRunningApplication
+    /// with the same logic the resolver uses internally. Keeps the
+    /// app-finding heuristic in one place.
+    func runningAppMatching(hint: String) -> NSRunningApplication? {
+        Self.findRunningApp(matching: hint)
+    }
+
     /// Find a running app whose localized name, bundle ID, or executable
     /// contains the hint (case-insensitive). Prefers regular apps
     /// (activationPolicy == .regular) over background agents, so a hint
@@ -464,8 +474,8 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
         let queryWords = Self.meaningfulWords(from: queryNormalized)
 
         // Hard wall-clock deadline so even a very responsive app with a
-        // huge tree can't stall us past 400ms. Better to miss a match and
-        // fall back to YOLO than to lock the pointing pipeline.
+        // huge tree can't stall us past 400ms. Better to miss a match
+        // and fall back to Gemini's box_2d than to lock the pipeline.
         let deadline = Date().addingTimeInterval(0.4)
 
         func walk(_ node: AXUIElement, depth: Int) {
@@ -730,7 +740,7 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
         return jaro + Double(prefixLength) * 0.1 * (1.0 - jaro)
     }
 
-    /// Stop words we strip before comparing text — same logic as NativeElementDetector.
+    /// Stop words we strip before comparing text.
     private static let stopWords: Set<String> = [
         "the", "a", "an", "this", "that", "these", "those",
         "button", "icon", "menu", "bar", "tab", "panel", "item", "option",

@@ -49,6 +49,9 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
 
                 Spacer().frame(height: 4)
+                autopilotToggleRow
+                    .padding(.horizontal, 16)
+                Spacer().frame(height: 6)
                 nekoModeToggleRow
                     .padding(.horizontal, 16)
             }
@@ -431,6 +434,60 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+    }
+
+    // MARK: - Autopilot Toggle
+
+    /// Promotes TipTour from teaching ("show me how") to autopilot
+    /// ("do it for me"). When ON, the cursor flies to each resolved
+    /// element and TipTour clicks it for the user; workflow plans
+    /// drive themselves end-to-end (including keyboard shortcuts and
+    /// text typing). When OFF (default), TipTour only points and the
+    /// user clicks themselves.
+    ///
+    /// We give this prominence in the panel — same row weight as Neko
+    /// — because it's a real change in behavior the user should be
+    /// aware of every time they open the panel.
+    private var autopilotToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: companionManager.isAutopilotEnabled
+                      ? "wand.and.stars"
+                      : "hand.tap")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(
+                        companionManager.isAutopilotEnabled
+                            ? DS.Colors.accent
+                            : DS.Colors.textTertiary
+                    )
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Autopilot")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text(
+                        companionManager.isAutopilotEnabled
+                            ? "TipTour clicks for you"
+                            : "TipTour only points; you click"
+                    )
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                }
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isAutopilotEnabled },
+                set: { companionManager.setAutopilotEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
     }
 
     // MARK: - Neko Mode Toggle
@@ -852,19 +909,6 @@ struct CompanionPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             #if DEBUG
             sectionHeader("DEBUG")
-
-            devToolRow("Detection Overlay", systemImage: "square.grid.3x3") {
-                companionManager.showDetectionOverlay.toggle()
-                if companionManager.showDetectionOverlay {
-                    companionManager.startDetectionOverlayFeeding()
-                } else {
-                    NativeElementDetector.shared.stopLiveFeeding()
-                }
-                NotificationCenter.default.post(name: .tipTourDismissPanel, object: nil)
-            } trailing: {
-                Text(companionManager.showDetectionOverlay ? "On" : "Off")
-                    .foregroundColor(companionManager.showDetectionOverlay ? DS.Colors.textSecondary : DS.Colors.textTertiary)
-            }
 
             devToolRow("Test Cursor Flight", systemImage: "arrow.up.right") {
                 let s = NSScreen.main!

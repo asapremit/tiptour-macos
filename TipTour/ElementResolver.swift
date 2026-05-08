@@ -4,14 +4,19 @@
 //
 //  Single entry point for "where on screen should the cursor fly to?"
 //
-//  Tries three lookup strategies in order of reliability:
-//    1. Accessibility tree (~30ms, pixel-perfect when app supports AX —
-//       almost all native Mac apps, most Electron apps, etc.)
-//    2. YOLO + OCR visual detection with LLM coordinate hint as proximity
-//       anchor (~10ms cached, fallback for apps with no AX — Blender,
-//       games, some web content)
-//    3. Raw LLM coordinates (~0ms, trust Claude/Gemini as absolute
-//       last resort when both local sources miss)
+//  Tries two lookup strategies in order of reliability:
+//    1. macOS Accessibility tree (~30ms, pixel-perfect when the app
+//       supports AX — almost all native Mac apps, most Cocoa third-party
+//       apps, and Electron apps that respect AXManualAccessibility).
+//    2. Raw Gemini-emitted box_2d coordinates as the absolute fallback.
+//       These come from the same model that named the element, so they
+//       reflect Gemini's spatial intent for that exact tool call.
+//
+//  The on-device YOLO + OCR visual detector that previously sat between
+//  these two tiers has been removed: the model's box_2d output covers
+//  the same fallback role with strictly better accuracy (one model, one
+//  decision, no fuzzy text-match drift), and the YOLO weights carried
+//  AGPL-3 distribution constraints we no longer want to ship with.
 //
 //  The resolver returns a global AppKit screen coordinate so the cursor
 //  overlay can fly to it without further conversion.
@@ -32,8 +37,7 @@ final class ElementResolver: @unchecked Sendable {
     /// telling the cursor what confidence to render with.
     enum ResolutionSource {
         case accessibilityTree       // AX tree gave us exact frame
-        case yoloWithLLMHint         // YOLO box near LLM's hint pixel
-        case llmRawCoordinates       // Straight from the LLM, no refinement
+        case llmRawCoordinates       // Straight from Gemini's box_2d, no refinement
     }
 
     struct Resolution {
@@ -47,25 +51,14 @@ final class ElementResolver: @unchecked Sendable {
         let source: ResolutionSource
         /// Global AppKit-space rect for the matched element, when the
         /// resolution source can produce one. AX always gives us this
-        /// (pixel-perfect). YOLO/LLM fallbacks don't — the click
-        /// detector falls back to a radius around `globalScreenPoint`
-        /// when this is nil.
+        /// (pixel-perfect). Raw box_2d does not — the click detector
+        /// falls back to a radius around `globalScreenPoint` when this
+        /// is nil.
         let globalScreenRect: CGRect?
     }
 
     // MARK: - Resolution
 
-    /// Resolve a cursor target from an LLM pointing tool call.
-    ///
-    /// - Parameters:
-    ///   - label: the element's label (e.g. "Save", "File menu")
-    ///   - llmHintInScreenshotPixels: the LLM's (x, y) in screenshot pixel
-    ///     space — typically derived from Gemini's `box_2d` field.
-    ///     Optional — when the model emits a label-only tool call this is
-    ///     nil and we rely on AX + YOLO+OCR label matching.
-    ///   - latestCapture: the screenshot + metadata (display frame, pixel
-    ///     dimensions) needed to convert screenshot pixels → global screen
-    ///     coordinates. Required for box_2d / YOLO paths; not used by AX.
     /// Try AX tree only. Runs on a background task so the walk doesn't
     /// block main. Returns nil if AX has no match for the label.
     /// `targetAppHint` (e.g. "Blender") lets us query the app the user
@@ -92,61 +85,7 @@ final class ElementResolver: @unchecked Sendable {
         )
     }
 
-    /// Try YOLO+OCR — both the label-only cache lookup (no coord hint)
-    /// and the coord-hinted refinement if the LLM gave us a hint.
-    /// Returns nil if neither strategy finds a match.
-    func tryYOLO(
-        label: String,
-        llmHintInScreenshotPixels: CGPoint?,
-        capture: CompanionScreenCapture,
-        proximityAnchorInGlobalScreen: CGPoint? = nil
-    ) async -> Resolution? {
-        // If we have a proximity anchor (previous step's resolved
-        // point), convert it into screenshot-pixel space so the
-        // detector can use it to tie-break between multiple equally-
-        // scoring label matches.
-        let proximityAnchorInScreenshotPixels = proximityAnchorInGlobalScreen.map {
-            globalScreenPointToScreenshotPixel($0, capture: capture)
-        }
-
-        // Label-only match — this is what worked well in the Claude-mode
-        // version: OCR finds the text "File", YOLO finds the button
-        // bounding box containing it, we use the button's center.
-        if let labelMatch = NativeElementDetector.shared.findFromCache(
-            query: label,
-            preferMatchesNearPixel: proximityAnchorInScreenshotPixels
-        ) {
-            let globalPoint = screenshotPixelToGlobalScreen(labelMatch.center, capture: capture)
-            let anchorLogNote = proximityAnchorInScreenshotPixels != nil ? " (proximity-biased)" : ""
-            print("[ElementResolver] ✓ YOLO label-match \"\(label)\" → \"\(labelMatch.label)\" at \(globalPoint)\(anchorLogNote)")
-            return Resolution(
-                globalScreenPoint: globalPoint,
-                displayFrame: capture.displayFrame,
-                label: label,
-                source: .yoloWithLLMHint,
-                globalScreenRect: nil
-            )
-        }
-
-        // Hint-based refinement — snap to the nearest YOLO box to the
-        // LLM's suggested coordinate.
-        if let hint = llmHintInScreenshotPixels,
-           let refined = NativeElementDetector.shared.refineCoordinate(hint: hint, label: label) {
-            let globalPoint = screenshotPixelToGlobalScreen(refined.center, capture: capture)
-            print("[ElementResolver] ✓ YOLO hint-refined \"\(label)\" at \(hint) → screen \(globalPoint)")
-            return Resolution(
-                globalScreenPoint: globalPoint,
-                displayFrame: capture.displayFrame,
-                label: label,
-                source: .yoloWithLLMHint,
-                globalScreenRect: nil
-            )
-        }
-
-        return nil
-    }
-
-    /// Absolute last resort — use the LLM's raw coordinate as-is.
+    /// Absolute last resort — use Gemini's raw box_2d coordinate as-is.
     func rawLLMCoordinate(
         label: String,
         llmHintInScreenshotPixels: CGPoint,
@@ -192,31 +131,29 @@ final class ElementResolver: @unchecked Sendable {
         return nil
     }
 
-    /// Full resolution pipeline: AX → box_2d → YOLO+OCR, tried in order
-    /// with early exit.
+    /// Full resolution pipeline: AX → box_2d, tried in order with early
+    /// exit.
     ///
-    /// Tier order is deliberate: when Gemini emits box_2d alongside the
-    /// label, those coordinates ARE the model's spatial intent. They
-    /// reflect everything Gemini knew about the image at tool-call time
-    /// — semantic understanding, disambiguation between same-text
-    /// elements, and pixel grounding from a model trained natively on
-    /// box_2d output. YOLO+OCR is a smaller local model with no semantic
-    /// context; if box_2d is present, trusting it produces a strictly
-    /// better answer than re-finding the label via fuzzy text-match.
+    /// Tier order is deliberate:
+    ///   1. AX tree first. Pixel-perfect when the app exposes one, and
+    ///      it's the only path that gives us a real element rect for
+    ///      the click detector to use as a tight hit region.
+    ///   2. Gemini's box_2d second. Those coordinates are the model's
+    ///      spatial output for the same query that emitted the label
+    ///      — one model, one decision. They reflect everything Gemini
+    ///      knew about the image at tool-call time: semantic
+    ///      understanding, disambiguation between same-text elements,
+    ///      and pixel grounding from a model trained natively on
+    ///      box_2d output.
     ///
-    /// YOLO+OCR remains valuable as a last-resort label search when AX
-    /// misses AND the model didn't emit box_2d (the rare case where the
-    /// LLM names an element but doesn't localize it).
-    ///
-    /// We still kick off a parallel detection pass when the app is
-    /// known to lack an AX tree, so the cache is warm if the resolver
-    /// falls all the way through.
+    /// If AX misses and Gemini didn't emit a box_2d, we have nothing
+    /// usable and return nil — the caller surfaces this to the user
+    /// rather than silently flying the cursor to a wrong location.
     func resolve(
         label: String,
         llmHintInScreenshotPixels: CGPoint?,
         latestCapture: CompanionScreenCapture?,
         targetAppHint: String? = nil,
-        runDetectorOnMiss: Bool = true,
         proximityAnchorInGlobalScreen: CGPoint? = nil
     ) async -> Resolution? {
 
@@ -229,29 +166,6 @@ final class ElementResolver: @unchecked Sendable {
             if ageSeconds > 1.0 {
                 print("[ElementResolver] ⚠ screenshot is \(String(format: "%.2f", ageSeconds))s old — coords may have drifted for \"\(label)\"")
             }
-        }
-
-        // Kick off YOLO+OCR detection in parallel with the AX walk so
-        // that IF AX misses, detection is already done (or nearly so)
-        // and we don't pay two serial waits. If AX hits first, we return
-        // and let this task finish on its own — its result lands in the
-        // detector's cache and benefits a future call.
-        //
-        // Skip the parallel detection entirely when the app is known to
-        // have an AX tree (common case) to avoid wasting CPU. The
-        // detector keeps a warm cache via its live-feed timer anyway.
-        let shouldPreloadDetection = runDetectorOnMiss
-            && latestCapture != nil
-            && AccessibilityTreeResolver.isAppKnownToLackAXTree(hint: targetAppHint)
-        let detectionTask: Task<Void, Never>?
-        if shouldPreloadDetection,
-           let capture = latestCapture,
-           let cgImage = CompanionManager.cgImage(from: capture.imageData) {
-            detectionTask = Task.detached(priority: .background) {
-                await NativeElementDetector.shared.detectElements(in: cgImage)
-            }
-        } else {
-            detectionTask = nil
         }
 
         // 1. AX tree first — fastest and most reliable for native apps.
@@ -295,14 +209,9 @@ final class ElementResolver: @unchecked Sendable {
             return nil
         }
 
-        // 2. Trust the model's box_2d when it gave us one. This is Gemini's
-        //    spatial output for the same query that emitted the label —
-        //    one model, one decision, no second-guessing it with a
-        //    smaller text-fuzzy-matcher. Avoids the failure mode where
-        //    YOLO+OCR confidently snaps the cursor to a different
-        //    element whose OCR'd text fuzzy-matches the model's
-        //    placeholder label (e.g. "Add Button" → "Add...." somewhere
-        //    on screen unrelated to where Gemini was actually pointing).
+        // 2. Trust the model's box_2d when it gave us one. This is
+        //    Gemini's spatial output for the same query that emitted
+        //    the label — one model, one decision.
         if let hint = llmHintInScreenshotPixels {
             return rawLLMCoordinate(
                 label: label,
@@ -311,33 +220,7 @@ final class ElementResolver: @unchecked Sendable {
             )
         }
 
-        // 3. No box_2d emitted — fall back to YOLO+OCR label search as a
-        //    last resort. This path only runs when AX missed AND the
-        //    model emitted just a label without localizing it. Run the
-        //    detection now if a parallel preload wasn't kicked off.
-        //    Detached at `.background` priority so Core Audio preempts
-        //    the CoreML pass — otherwise sustained YOLO inference can
-        //    push HALC_ProxyIOContext into "skipping cycle due to
-        //    overload" and we hear breaks in Gemini's voice playback.
-        if let detectionTask {
-            await detectionTask.value
-        } else if runDetectorOnMiss,
-                  let cgImage = CompanionManager.cgImage(from: capture.imageData) {
-            await Task.detached(priority: .background) {
-                await NativeElementDetector.shared.detectElements(in: cgImage)
-            }.value
-        }
-
-        if let yoloResolution = await tryYOLO(
-            label: label,
-            llmHintInScreenshotPixels: nil,
-            capture: capture,
-            proximityAnchorInGlobalScreen: proximityAnchorInGlobalScreen
-        ) {
-            return yoloResolution
-        }
-
-        print("[ElementResolver] ✗ could not resolve \"\(label)\" — all strategies missed")
+        print("[ElementResolver] ✗ could not resolve \"\(label)\" — AX missed and no box_2d hint")
         return nil
     }
 
@@ -465,31 +348,6 @@ final class ElementResolver: @unchecked Sendable {
             x: displayLocalX + displayFrame.origin.x,
             y: appKitY + displayFrame.origin.y
         )
-    }
-
-    /// Inverse of `screenshotPixelToGlobalScreen`. Maps a global AppKit
-    /// point (bottom-left origin, spans all displays) back into the
-    /// screenshot's pixel coordinate space (top-left origin). Used to
-    /// pass a proximity anchor from global-screen-land into the
-    /// detector's pixel-space tie-breaker.
-    private func globalScreenPointToScreenshotPixel(
-        _ globalPoint: CGPoint,
-        capture: CompanionScreenCapture
-    ) -> CGPoint {
-        let screenshotWidth = CGFloat(capture.screenshotWidthInPixels)
-        let screenshotHeight = CGFloat(capture.screenshotHeightInPixels)
-        let displayWidth = CGFloat(capture.displayWidthInPoints)
-        let displayHeight = CGFloat(capture.displayHeightInPoints)
-        let displayFrame = capture.displayFrame
-
-        let displayLocalX = globalPoint.x - displayFrame.origin.x
-        let appKitY = globalPoint.y - displayFrame.origin.y
-        let displayLocalY = displayHeight - appKitY
-
-        let pixelX = displayLocalX * (screenshotWidth / displayWidth)
-        let pixelY = displayLocalY * (screenshotHeight / displayHeight)
-
-        return CGPoint(x: pixelX, y: pixelY)
     }
 
     /// Find the NSScreen whose frame contains the given global AppKit point.

@@ -272,16 +272,6 @@ struct BlueCursorView: View {
                     }
             }
 
-            // YOLO detection overlay — shows all detected elements as boxes
-            if companionManager.showDetectionOverlay {
-                DetectionOverlayView(
-                    elements: companionManager.detectedElements,
-                    highlightedLabel: companionManager.highlightedElementLabel,
-                    screenFrame: screenFrame,
-                    imageSize: companionManager.detectedImageSize
-                )
-            }
-
             // Navigation pointer bubble — shown when buddy arrives at a detected element.
             // Pops in with a scale-bounce (0.5x → 1.0x spring) and a bright initial
             // glow that settles, creating a "materializing" effect.

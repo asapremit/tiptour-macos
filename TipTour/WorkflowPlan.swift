@@ -38,8 +38,9 @@ struct WorkflowStep: Codable, Identifiable, Hashable {
     /// Used for the on-screen step list UI (e.g. "Click the File menu").
     let hint: String
 
-    /// Optional hint coordinate from the LLM. Used by ElementResolver
-    /// for YOLO proximity snapping when AX/OCR labels don't resolve.
+    /// Optional hint coordinate from the LLM (Gemini's box_2d center
+    /// in screenshot pixel space). Used by ElementResolver as the
+    /// fallback when the AX tree has no match for the label.
     let hintX: Int?
     let hintY: Int?
 

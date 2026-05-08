@@ -42,15 +42,6 @@ final class CompanionManager: ObservableObject {
     /// Custom speech bubble text for the pointing animation.
     @Published var detectedElementBubbleText: String?
 
-    /// Show YOLO detection boxes overlay — toggle from dev tools.
-    @Published var showDetectionOverlay: Bool = false
-    /// Latest detected elements from the native detector for overlay rendering.
-    @Published var detectedElements: [[String: Any]] = []
-    /// Image size of the screenshot used for detection (for coordinate scaling).
-    @Published var detectedImageSize: [Int] = [1512, 982]
-    /// The element currently being highlighted (matched by voice query).
-    @Published var highlightedElementLabel: String? = nil
-
     /// Whether the blue cursor overlay is currently visible on screen.
     @Published private(set) var isOverlayVisible: Bool = false
 
@@ -180,11 +171,11 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Tool Handlers
 
-    /// Handle the `point_at_element` tool call. Resolves the label via the
-    /// AX tree → YOLO + OCR cascade and flies the cursor there. When Gemini
-    /// supplies a `box_2d`, its center (in screenshot-pixel space) is fed
-    /// to the resolver as a coordinate hint for the YOLO and raw-LLM-coord
-    /// fallbacks.
+    /// Handle the `point_at_element` tool call. Resolves the label via
+    /// the AX tree → Gemini box_2d cascade and flies the cursor there.
+    /// When Gemini supplies a `box_2d`, its center (in screenshot-pixel
+    /// space) is fed to the resolver as the box_2d-tier fallback when
+    /// AX misses.
     @MainActor
     private func handleToolPointAtElement(
         id: String,
@@ -233,6 +224,13 @@ final class CompanionManager: ObservableObject {
         // previous workflow.
         ClickDetector.shared.disarm()
 
+        // Autopilot — single-element pointing also clicks for the user
+        // when the toggle is on. Same delay as workflow steps so the
+        // user sees the cursor land before the click fires.
+        if isAutopilotEnabled {
+            scheduleAutopilotClickForSinglePoint(resolution: resolution)
+        }
+
         // Mute screenshot pushes until the user speaks again so Gemini doesn't
         // re-emit the same tool call on a "user hasn't moved" frame.
         voiceBackend.suppressScreenshotsUntilUserSpeaks()
@@ -240,8 +238,33 @@ final class CompanionManager: ObservableObject {
         return [
             "ok": true,
             "label": resolution.label,
-            "source": String(describing: resolution.source)
+            "source": String(describing: resolution.source),
+            "autopilot": isAutopilotEnabled
         ]
+    }
+
+    /// Fire an autopilot click ~650ms after a single-element
+    /// `point_at_element` resolution, mirroring the workflow runner's
+    /// auto-click delay so single asks and multi-step plans feel
+    /// identical when the toggle is on.
+    private func scheduleAutopilotClickForSinglePoint(
+        resolution: ElementResolver.Resolution
+    ) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard let self else { return }
+            // If autopilot was toggled OFF during the cursor flight,
+            // honor that — the user changed their mind mid-action.
+            guard self.isAutopilotEnabled else { return }
+            do {
+                try await ActionExecutor.shared.click(
+                    atGlobalScreenPoint: resolution.globalScreenPoint,
+                    activatingTargetApp: AccessibilityTreeResolver.userTargetAppOverride
+                )
+            } catch {
+                print("[Tool] autopilot click failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Handle the `submit_workflow_plan` tool call. Gemini produces the
@@ -277,8 +300,8 @@ final class CompanionManager: ObservableObject {
             let hint = raw["hint"] as? String ?? ""
 
             // Convert Gemini's box_2d ([y1, x1, y2, x2] in [0, 1000]) to
-            // the box's center in screenshot-pixel space. The downstream
-            // resolver / YOLO pipeline expects pixel coords.
+            // the box's center in screenshot-pixel space. The resolver's
+            // box_2d-fallback tier expects pixel coords.
             let box2DNormalized = (raw["box_2d"] as? [Int]).flatMap { $0.count == 4 ? $0 : nil }
             let pixelCenter = pixelHintFromBox2D(
                 box2DNormalized: box2DNormalized,
@@ -421,6 +444,28 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "isNekoModeEnabled")
     }
 
+    /// Autopilot mode: when enabled, TipTour CLICKS the resolved
+    /// element instead of waiting for the user to click it. Single
+    /// `point_at_element` calls click immediately after the cursor
+    /// flight finishes; workflow plans drive themselves end-to-end.
+    ///
+    /// Defaults OFF — teaching mode (point only, user clicks) is
+    /// TipTour's safe default identity. Persisted per-user so power
+    /// users don't have to flip it every launch, but the menu bar
+    /// panel exposes it prominently so it's never hidden.
+    ///
+    /// Safety net: `WorkflowRunner` already pauses when the user
+    /// Cmd-Tabs to an unrelated app, when a modal dialog appears, and
+    /// when the post-click AX fingerprint didn't change. Pressing the
+    /// hotkey closes the Gemini Live session and stops anything in
+    /// flight. Autopilot rides those rails — it doesn't bypass them.
+    @Published var isAutopilotEnabled: Bool = UserDefaults.standard.bool(forKey: "isAutopilotEnabled")
+
+    func setAutopilotEnabled(_ enabled: Bool) {
+        isAutopilotEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isAutopilotEnabled")
+    }
+
     /// Debug flag for the workflow checklist: when true, ClickDetector
     /// advances on ANY click instead of requiring the click to land
     /// within 40pt of the resolved target.
@@ -518,6 +563,14 @@ final class CompanionManager: ObservableObject {
         beginTrackingUserTargetApp()
         ClickDetector.advanceOnAnyClickEnabled = advanceOnAnyClickEnabled
 
+        // Wire the autopilot toggle into the workflow runner. The
+        // runner reads this on every step to decide whether to fly the
+        // cursor and wait (teaching) or fly the cursor and click
+        // (autopilot).
+        WorkflowRunner.shared.isAutopilotEnabledProvider = { [weak self] in
+            self?.isAutopilotEnabled ?? false
+        }
+
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
         // were revoked (e.g. signing change), don't show the cursor — the
@@ -543,7 +596,6 @@ final class CompanionManager: ObservableObject {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
-        highlightedElementLabel = nil
     }
 
     // MARK: - Permissions
@@ -766,26 +818,6 @@ final class CompanionManager: ObservableObject {
         detectedElementBubbleText = resolution.label
     }
 
-    // MARK: - Detection Overlay (Debug)
-
-    func startDetectionOverlayFeeding() {
-        NativeElementDetector.shared.startLiveFeeding(interval: 1.5) { [weak self] in
-            guard let cgImage = try? await CompanionScreenCaptureUtility.capturePrimaryScreenAsCGImage() else { return nil }
-            Task {
-                await self?.updateDetectionOverlay()
-            }
-            return cgImage
-        }
-    }
-
-    private func updateDetectionOverlay() async {
-        let cached = NativeElementDetector.shared.getCachedElements()
-        await MainActor.run {
-            self.detectedElements = cached.elements
-            self.detectedImageSize = cached.imageSize
-        }
-    }
-
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
@@ -856,8 +888,30 @@ final class CompanionManager: ObservableObject {
       arguments:
         goal  = short summary of the user's intent ("create a new file", "render an animation").
         app   = exact foreground app name visible in the screenshot ("Blender", "Xcode", "GarageBand"). never "macOS" or "unknown".
-        steps = ordered array of {label, hint, box_2d?}. first step MUST be visible on the current screen. subsequent steps describe the path to take after clicking step 1.
+        steps = ordered array of {type?, label, hint, box_2d?}. first step MUST be visible on the current screen. subsequent steps describe the path to take after clicking step 1.
         box_2d = OPTIONAL bounding box for the step's element in [y1, x1, y2, x2] form, each value in [0, 1000] normalized to the current screenshot. origin top-left, y first. include it whenever you can on step 1 — it's how this model is natively trained to localize. ALWAYS include it for apps without accessibility (Blender, games, canvas tools).
+
+    STEP TYPES (for submit_workflow_plan):
+    every step has an optional `type` field. omit it and it defaults to "click", which is what 95% of steps are. only emit a non-click type when the step is genuinely not a click on visible UI.
+
+      type: "click"  (default — omit the field)
+        label = literal visible text on screen (the element to click).
+        use this for menus, buttons, tabs, items, links, fields you need to focus by clicking, anything you can SEE.
+
+      type: "keyboardShortcut"
+        label = the shortcut combo as written (e.g. "Cmd+S", "Cmd+Shift+N", "Cmd+Space", "Return", "Escape").
+        ONLY use when the action is purely a key press, not a click. examples: confirming a dialog with Return, opening Spotlight with Cmd+Space, saving with Cmd+S when the user explicitly wants the shortcut path. never use this just because there IS a shortcut — if the user can ALSO click File → Save, prefer the click steps so the user learns the menu path.
+        modifier names recognized: Cmd / Command, Opt / Option / Alt, Ctrl / Control, Shift, Fn. key names: letters, digits, Space, Return, Tab, Escape, Delete, Left/Right/Up/Down, Home, End, PageUp, PageDown, F1-F12.
+
+      type: "type"
+        label = the literal text to type into the currently focused field.
+        ONLY use after a step has focused a text field (clicking it, or a Cmd+N that opens a fresh field). NEVER chain two `type` steps — concatenate the text into one step instead.
+        do NOT translate the text. if the user said "type 'on my way'", the label is exactly `on my way`, not the user's spoken language.
+
+    SECURE-FIELD RULE (CRITICAL — read every time):
+    NEVER emit a `type` step targeting a password / passcode / 2FA / credit-card / secret-token field, even if the user asks. AX marks these as secure-text inputs; pasting into them via autopilot would echo the user's secrets through the system pasteboard. instead, click the field with a regular click step so the cursor lands there, and let the user type the secret themselves. for the spoken narration say something like "i'll bring you to the password field — type it yourself".
+
+    LOGIN / 2FA RULE: when a workflow lands on a sign-in screen, an OAuth consent screen, or a 2FA prompt, STOP the plan there and hand off. do not auto-click "Continue" / "Allow" / "Sign in" buttons that finalize a credential exchange.
 
     ABSOLUTE RULES:
     - exactly ONE tool call per turn. never both tools, never the same tool twice.
@@ -894,6 +948,40 @@ final class CompanionManager: ObservableObject {
       → speak: "here's how to create a new file."
       (then later, per-step NARRATE: messages arrive one at a time)
 
+    user: "save this file as report.pdf"
+      (Pages is foreground, document is unsaved)
+      → submit_workflow_plan(goal: "save the file as report.pdf", app: "Pages",
+           steps: [{type:"keyboardShortcut", label:"Cmd+S", hint:"Open the save sheet"},
+                   {type:"type", label:"report.pdf", hint:"Type the filename"},
+                   {type:"keyboardShortcut", label:"Return", hint:"Confirm save"}])
+      → speak: "saving as report.pdf."
+
+    user: "make a new folder on the desktop called Photos"
+      (Finder is foreground, desktop visible)
+      → submit_workflow_plan(goal: "create a Photos folder on the desktop", app: "Finder",
+           steps: [{type:"keyboardShortcut", label:"Cmd+Shift+N", hint:"New folder shortcut"},
+                   {type:"type", label:"Photos", hint:"Type the folder name"},
+                   {type:"keyboardShortcut", label:"Return", hint:"Confirm name"}])
+      → speak: "making a Photos folder."
+
+    user: "open Activity Monitor"
+      → submit_workflow_plan(goal: "launch Activity Monitor", app: "Spotlight",
+           steps: [{type:"keyboardShortcut", label:"Cmd+Space", hint:"Open Spotlight"},
+                   {type:"type", label:"Activity Monitor", hint:"Search for the app"},
+                   {type:"keyboardShortcut", label:"Return", hint:"Launch it"}])
+      → speak: "opening Activity Monitor."
+
+    user: "send 'on my way' to mom in messages"
+      (Messages is foreground, the user is in mom's thread)
+      → submit_workflow_plan(goal: "send a message to mom", app: "Messages",
+           steps: [{label:"iMessage", hint:"Click the message field to focus it"},
+                   {type:"type", label:"on my way", hint:"Type the message"},
+                   {type:"keyboardShortcut", label:"Return", hint:"Send"}])
+      → speak: "sending 'on my way'."
+
+    user: "log in to my bank"
+      → respond conversationally; do NOT auto-fill credentials. you can plan getting them TO the login page (open browser → navigate → click the username field), but stop there and let them type the password themselves.
+
     user: "what is HTML"
       → no tool
       → speak your answer
@@ -920,17 +1008,23 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Start a Gemini Live session on hotkey press. Three things run in parallel
-    /// from the instant the hotkey fires:
+    /// Start a Gemini Live session on hotkey press. Two things run in
+    /// parallel from the instant the hotkey fires:
     ///   1. WebSocket open + Gemini session setup (~300-500ms)
-    ///   2. Screenshot capture + YOLO/OCR detection on the active frame
-    ///   3. AX tree warmup on the frontmost app
-    /// By the time Gemini's first response streams back, both the YOLO cache
-    /// and the AX tree are already hot — so the very first tool call resolves
-    /// as accurately as every subsequent one.
+    ///   2. Real AX-tree prefetch on the user's target app — walks the
+    ///      frontmost app's AX tree and primes the set-of-marks cache so
+    ///      the moment Gemini emits its first tool call, the resolver
+    ///      already has the AX data it needs.
+    ///
+    /// The prefetch overlaps the user's first words / Gemini's session
+    /// setup, so the latency cost (typically 50-300ms on Cocoa apps,
+    /// up to 1s on heavy Electron trees) lands entirely in "free" time.
+    /// This is the single biggest perceived-latency win on the warm
+    /// path: by the time the first `point_at_element` arrives,
+    /// resolution returns in ~10-30ms instead of 100-400ms.
     func startVoiceSession() {
         Task.detached(priority: .userInitiated) {
-            await Self.warmLocalResolvers()
+            await Self.prefetchAccessibilityTreeForTargetApp()
         }
 
         Task {
@@ -942,13 +1036,22 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Capture a fresh frame + run YOLO/OCR + prime the AX tree.
-    private static func warmLocalResolvers() async {
-        if let cgImage = try? await CompanionScreenCaptureUtility.capturePrimaryScreenAsCGImage() {
-            await Task.detached(priority: .background) {
-                await NativeElementDetector.shared.detectElements(in: cgImage)
-            }.value
-        }
+    /// Walk the user's target app AX tree to prime caches so the first
+    /// `point_at_element` resolves against warm data. The set-of-marks
+    /// walk inside `setOfMarksForTargetApp` is the heaviest AX call
+    /// the resolver makes at runtime, so doing it now means the first
+    /// real `findElement` call is mostly cached I/O.
+    ///
+    /// Uses the snapshot of the user's frontmost app captured at hotkey
+    /// press time (set in `handleShortcutTransition`) — never our own
+    /// menu bar app.
+    private static func prefetchAccessibilityTreeForTargetApp() async {
+        let resolver = AccessibilityTreeResolver()
+        // Touch set-of-marks first (warms the full traversal cache),
+        // then a "no-match-expected" findElement call so any
+        // empty-tree detection (Blender / canvas apps) is recorded
+        // before the first real resolution attempt arrives.
+        _ = resolver.setOfMarksForTargetApp(hint: nil)
         _ = await ElementResolver.shared.tryAccessibilityTree(label: "__warmup__")
     }
 
