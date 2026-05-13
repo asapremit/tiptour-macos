@@ -4,7 +4,7 @@
 
 # TipTour
 
-**Talk to your Mac. Point at anything. Let AI act on it.**
+**This and That**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Platform: macOS 14+](https://img.shields.io/badge/Platform-macOS%2014+-black)](https://www.apple.com/macos)
@@ -17,8 +17,11 @@ Hold the hotkey, say what you want, and TipTour can point, click, type, open app
 
 ## What You Can Say
 
-- "Open Google Docs and write a short essay."
+- "Open Apple Notes and write a short essay"
+
+Then you can do a freeform highlight by holding Control+Shift and moving your mouse and say
 - "Change this word."
+
 - "Move this over there."
 - "Click the Blank document."
 - "Make this line sound softer."
