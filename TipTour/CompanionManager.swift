@@ -60,13 +60,11 @@ final class CompanionManager: ObservableObject {
     let globalHighlightShortcutMonitor = GlobalHighlightShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL: String = {
-        let url = "https://clicky-proxy.milindsoni201.workers.dev"
-        // ElementResolver's multilingual /match-label fallback hits
-        // the same worker. Setting the override here keeps one source
-        // of truth for the base URL.
+    /// Optional Cloudflare Worker proxy for distributed builds. Source
+    /// builds intentionally do not hardcode the maintainer's Worker URL;
+    /// builders should paste their own Gemini key in the panel instead.
+    private static let workerBaseURL: String? = {
+        let url = AppBundleConfiguration.stringValue(forKey: "TipTourWorkerBaseURL")
         ElementResolver.workerBaseURLOverride = url
         return url
     }()
@@ -92,7 +90,7 @@ final class CompanionManager: ObservableObject {
     var voiceBackend: GeminiLiveSession {
         if let existing = _voiceBackend { return existing }
         let backend = GeminiLiveSession(
-            apiKeyURL: "\(Self.workerBaseURL)/gemini-live-key",
+            apiKeyURL: Self.workerBaseURL.map { "\($0)/gemini-live-key" },
             systemPrompt: Self.companionVoiceResponseSystemPrompt
         )
         wireCallbacks(on: backend)
@@ -121,6 +119,7 @@ final class CompanionManager: ObservableObject {
                 && self.previousInputTranscriptLength == 0
             if isNewUtterance {
                 self.handledToolCallIDsThisUtterance.removeAll()
+                self.acceptedToolCallIDThisUtterance = nil
                 if !self.sendLatestFocusHighlightContextToGeminiIfPossible() {
                     self.sendLatestHoverWindowContextToGeminiIfPossible()
                 }
@@ -187,13 +186,129 @@ final class CompanionManager: ObservableObject {
         return CGPoint(x: pixelX, y: pixelY)
     }
 
+    private func normalizedWorkflowSteps(
+        _ steps: [WorkflowStep],
+        targetAppName: String
+    ) -> [WorkflowStep] {
+        coalescingConsecutiveTypeSteps(
+            normalizingNewNoteSteps(steps, targetAppName: targetAppName)
+        )
+    }
+
+    private func normalizingNewNoteSteps(
+        _ steps: [WorkflowStep],
+        targetAppName: String
+    ) -> [WorkflowStep] {
+        let normalizedAppName = targetAppName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalizedAppName == "notes" else { return steps }
+
+        return steps.map { step in
+            guard step.type == .click || step.type == .keyboardShortcut,
+                  let label = step.label?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  label == "new note" else {
+                return step
+            }
+
+            print("[Workflow] normalized Notes \"New Note\" click to Cmd+N")
+            return WorkflowStep(
+                id: step.id,
+                type: .keyboardShortcut,
+                label: "Cmd+N",
+                value: step.value,
+                direction: step.direction,
+                amount: step.amount,
+                by: step.by,
+                targetContext: step.targetContext,
+                hint: step.hint.isEmpty ? "Create a new note" : step.hint,
+                hintX: nil,
+                hintY: nil,
+                box2DNormalized: nil,
+                screenNumber: step.screenNumber
+            )
+        }
+    }
+
+    private func coalescingConsecutiveTypeSteps(_ steps: [WorkflowStep]) -> [WorkflowStep] {
+        var normalizedSteps: [WorkflowStep] = []
+        var currentIndex = 0
+
+        while currentIndex < steps.count {
+            let step = steps[currentIndex]
+            guard step.type == .type else {
+                normalizedSteps.append(step)
+                currentIndex += 1
+                continue
+            }
+
+            var textParts: [String] = []
+            var lastTypeStep = step
+            while currentIndex < steps.count, steps[currentIndex].type == .type {
+                if let text = steps[currentIndex].value ?? steps[currentIndex].label, !text.isEmpty {
+                    textParts.append(text)
+                }
+                lastTypeStep = steps[currentIndex]
+                currentIndex += 1
+            }
+
+            guard !textParts.isEmpty else {
+                normalizedSteps.append(step)
+                continue
+            }
+
+            if textParts.count > 1 {
+                print("[Workflow] coalesced \(textParts.count) consecutive type steps into one paste")
+            }
+            normalizedSteps.append(
+                WorkflowStep(
+                    id: step.id,
+                    type: .type,
+                    label: step.label,
+                    value: textParts.joined(separator: "\n\n"),
+                    direction: lastTypeStep.direction,
+                    amount: lastTypeStep.amount,
+                    by: lastTypeStep.by,
+                    targetContext: step.targetContext ?? lastTypeStep.targetContext,
+                    hint: step.hint.isEmpty ? lastTypeStep.hint : step.hint,
+                    hintX: step.hintX,
+                    hintY: step.hintY,
+                    box2DNormalized: step.box2DNormalized,
+                    screenNumber: step.screenNumber
+                )
+            )
+        }
+
+        return normalizedSteps
+    }
+
     // MARK: - Tool Handlers
 
-    /// Handle the `point_at_element` tool call. Resolves the label via
-    /// the AX tree → Gemini box_2d cascade and flies the cursor there.
-    /// When Gemini supplies a `box_2d`, its center (in screenshot-pixel
-    /// space) is fed to the resolver as the box_2d-tier fallback when
-    /// AX misses.
+    private func rejectIfToolCallShouldNotRun(
+        id: String,
+        toolName: String
+    ) -> [String: Any]? {
+        if handledToolCallIDsThisUtterance.contains(id) {
+            print("[Tool] ⏭️  ignoring duplicate \(toolName) id=\(id)")
+            return ["ok": true, "duplicate": true]
+        }
+
+        if let acceptedToolCallIDThisUtterance {
+            print("[Tool] ⏭️  rejecting \(toolName) id=\(id) — already accepted tool id=\(acceptedToolCallIDThisUtterance) for this utterance")
+            handledToolCallIDsThisUtterance.insert(id)
+            voiceBackend.invalidateScreenshotHashCache()
+            return [
+                "ok": false,
+                "reason": "tool_already_handled_this_utterance",
+                "message": "A tool call has already been accepted for this spoken request. Do not call another tool until the user speaks again."
+            ]
+        }
+
+        handledToolCallIDsThisUtterance.insert(id)
+        acceptedToolCallIDThisUtterance = id
+        return nil
+    }
+
+    /// Legacy tool handler. The tool is no longer declared in Gemini's
+    /// setup; keep this reject path for old/resumed sessions.
     @MainActor
     private func handleToolPointAtElement(
         id: String,
@@ -201,89 +316,14 @@ final class CompanionManager: ObservableObject {
         box2DNormalized: [Int]?,
         screenshotJPEG: Data?
     ) async -> [String: Any] {
-        if handledToolCallIDsThisUtterance.contains(id) {
-            print("[Tool] ⏭️  ignoring duplicate point_at_element id=\(id)")
-            return ["ok": true, "duplicate": true]
-        }
         handledToolCallIDsThisUtterance.insert(id)
-
-        // A point_at_element call means the user is asking about a single
-        // visible element — supersede any abandoned multi-step plan.
-        if let activePlan = WorkflowRunner.shared.activePlan {
-            print("[Tool] 🔄 superseding active plan \"\(activePlan.goal)\" — user asked for a single element \"\(label)\"")
-            WorkflowRunner.shared.stop()
-        }
-        let capture = voiceBackend.latestCapture
-        let hintInScreenshotPixels = pixelHintFromBox2D(
-            box2DNormalized: box2DNormalized,
-            capture: capture
-        )
-        if let hintInScreenshotPixels {
-            print("[Tool] 🔧 point_at_element(label=\"\(label)\", box_2d=\(box2DNormalized ?? []) → screenshot pixel \(hintInScreenshotPixels))")
-        } else {
-            print("[Tool] 🔧 point_at_element(label=\"\(label)\")")
-        }
-        let startedAt = Date()
-        let resolution = await ElementResolver.shared.resolve(
-            label: label,
-            llmHintInScreenshotPixels: hintInScreenshotPixels,
-            latestCapture: capture,
-            targetAppHint: AccessibilityTreeResolver.userTargetAppOverride?.localizedName
-        )
-        let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
-        guard let resolution else {
-            print("[Tool] ✗ point_at_element(\"\(label)\") → no match after \(elapsed)ms")
-            voiceBackend.invalidateScreenshotHashCache()
-            return ["ok": false, "reason": "element_not_found", "label": label]
-        }
-        print("[Tool] ✓ point_at_element(\"\(label)\") → \(resolution.label) via \(resolution.source) in \(elapsed)ms")
-        pointAtResolution(resolution)
-
-        // Single-click ask — disarm any leftover ClickDetector state from a
-        // previous workflow.
-        ClickDetector.shared.disarm()
-
-        // Autopilot — single-element pointing also clicks for the user
-        // when the toggle is on. Same delay as workflow steps so the
-        // user sees the cursor land before the click fires.
-        if isAutopilotEnabled {
-            scheduleAutopilotClickForSinglePoint(resolution: resolution)
-        }
-
-        // Mute screenshot pushes until the user speaks again so Gemini doesn't
-        // re-emit the same tool call on a "user hasn't moved" frame.
-        voiceBackend.suppressScreenshotsUntilUserSpeaks()
-
+        voiceBackend.invalidateScreenshotHashCache()
+        print("[Tool] ⏭️  point_at_element disabled — rejected \"\(label)\"")
         return [
-            "ok": true,
-            "label": resolution.label,
-            "source": String(describing: resolution.source),
-            "autopilot": isAutopilotEnabled
+            "ok": false,
+            "reason": "point_at_element_disabled",
+            "message": "point_at_element is disabled. Use submit_workflow_plan for computer actions, or answer conversationally for visual explanations."
         ]
-    }
-
-    /// Fire an autopilot click ~650ms after a single-element
-    /// `point_at_element` resolution, mirroring the workflow runner's
-    /// auto-click delay so single asks and multi-step plans feel
-    /// identical when the toggle is on.
-    private func scheduleAutopilotClickForSinglePoint(
-        resolution: ElementResolver.Resolution
-    ) {
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 650_000_000)
-            guard let self else { return }
-            // If autopilot was toggled OFF during the cursor flight,
-            // honor that — the user changed their mind mid-action.
-            guard self.isAutopilotEnabled else { return }
-            do {
-                try await ActionExecutor.shared.click(
-                    atGlobalScreenPoint: resolution.globalScreenPoint,
-                    activatingTargetApp: AccessibilityTreeResolver.userTargetAppOverride
-                )
-            } catch {
-                print("[Tool] autopilot click failed: \(error.localizedDescription)")
-            }
-        }
     }
 
     /// Handle the `submit_workflow_plan` tool call. Gemini produces the
@@ -291,11 +331,9 @@ final class CompanionManager: ObservableObject {
     /// raw tool args into a WorkflowPlan and kicks off the runner.
     @MainActor
     private func handleToolSubmitWorkflowPlan(id: String, goal: String, app: String, steps: [[String: Any]]) async -> [String: Any] {
-        if handledToolCallIDsThisUtterance.contains(id) {
-            print("[Tool] ⏭️  ignoring duplicate submit_workflow_plan id=\(id)")
-            return ["ok": true, "duplicate": true]
+        if let rejection = rejectIfToolCallShouldNotRun(id: id, toolName: "submit_workflow_plan") {
+            return rejection
         }
-        handledToolCallIDsThisUtterance.insert(id)
 
         if let activePlan = WorkflowRunner.shared.activePlan {
             let isSameGoalAsActivePlan = activePlan.goal.caseInsensitiveCompare(goal) == .orderedSame
@@ -314,7 +352,7 @@ final class CompanionManager: ObservableObject {
         print("[Tool] 🔧 submit_workflow_plan(goal=\"\(goal)\", app=\"\(app)\", \(steps.count) steps)")
 
         let captureForBoxConversion = voiceBackend.latestCapture
-        let parsedSteps: [WorkflowStep] = steps.enumerated().map { index, raw in
+        let parsedStepsBeforeNormalization: [WorkflowStep] = steps.enumerated().map { index, raw in
             let label = raw["label"] as? String
             let hint = raw["hint"] as? String ?? ""
             let type = WorkflowStep.StepType.normalized(from: raw["type"] as? String)
@@ -348,6 +386,10 @@ final class CompanionManager: ObservableObject {
                 screenNumber: nil
             )
         }
+        let parsedSteps = normalizedWorkflowSteps(
+            parsedStepsBeforeNormalization,
+            targetAppName: app
+        )
 
         guard !parsedSteps.isEmpty else {
             print("[Tool] ✗ submit_workflow_plan — zero steps")
@@ -456,6 +498,7 @@ final class CompanionManager: ObservableObject {
     /// Set of tool-call IDs we've already dispatched within the current
     /// user utterance. Reset when a new user utterance starts.
     private var handledToolCallIDsThisUtterance: Set<String> = []
+    private var acceptedToolCallIDThisUtterance: String?
 
     /// Tracks input transcript length on the last update so we can detect
     /// "transcript went from empty → non-empty" — the reliable signal that
@@ -487,8 +530,8 @@ final class CompanionManager: ObservableObject {
 
     /// Autopilot mode: when enabled, TipTour CLICKS the resolved
     /// element instead of waiting for the user to click it. Single
-    /// `point_at_element` calls click immediately after the cursor
-    /// flight finishes; workflow plans drive themselves end-to-end.
+    /// workflow plans drive themselves end-to-end. Actions must use a
+    /// CUA workflow plan so they are token-gated and app-scoped.
     ///
     /// Defaults ON so TipTour can take actions by default. Persisted
     /// per-user so people can still switch back to teaching mode and
@@ -1494,20 +1537,15 @@ final class CompanionManager: ObservableObject {
     - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
     - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
 
-    element pointing via tools (VERY IMPORTANT — read carefully):
+    computer control via tools (VERY IMPORTANT — read carefully):
 
-    you have exactly TWO tools. call AT MOST ONE tool per turn. do NOT narrate before the tool call. call it silently, wait for the response, THEN speak ONCE.
+    you have exactly ONE tool: submit_workflow_plan. call AT MOST ONE tool per turn. do NOT narrate before the tool call. call it silently, wait for the response, THEN speak ONCE.
 
     \(Self.multiStepTourGuidePromptRule)
 
-    TOOL: point_at_element(label, box_2d?)
-      use for a SINGLE visible element. examples: "where's the save button", "point at the color inspector", "what is this tab".
-      label = literal visible text on screen.
-      box_2d = OPTIONAL bounding box in [y1, x1, y2, x2] form, each value in [0, 1000] normalized to the screenshot. origin top-left, y first. include this whenever you can — it's how this model is natively trained to localize. ALWAYS include it for apps without accessibility (Blender, games, canvas tools) and whenever the label is ambiguous.
-
     UI ELEMENT HINTS (set-of-marks):
     alongside screenshots you will sometimes receive a "UI elements on screen" message listing pointable elements as [role:label] tokens — for example [button:Save] [menu:File] [item:New File...] [tab:Preview] [field:Search].
-    these labels come straight from the accessibility tree, so they are guaranteed to resolve. when a listed element matches what the user asked for, pass that EXACT label string (the part after the colon) to point_at_element or to a workflow step. if nothing matches, fall back to the visible text you see in the screenshot.
+    these labels come straight from the accessibility tree, so they are guaranteed to resolve. when a listed element matches what the user asked for, pass that EXACT label string (the part after the colon) to a workflow step. if nothing matches, fall back to the visible text you see in the screenshot.
 
     FOCUS HIGHLIGHT CONTEXT:
     the user can hold control plus shift and paint a freeform highlight over part of the screen. when they do, you receive a "user focus highlight context" message with a global rect, a current hover / last painted point, the hovered app/window target, and usually a normalized box_2d for the latest screenshot. treat phrases like "this", "that line", "this area", "rewrite this", "change this", "make this better", or "update the highlighted part" as referring to that highlighted region inside that hovered app/window. prefer visible elements, text fields, and text ranges that intersect the highlighted region. when an action should operate on that highlighted region, set targetContext:"currentHighlight" on the action step. when it should operate on a normal native selection, set targetContext:"currentSelection". when it should operate on the currently focused field, set targetContext:"focusedElement". do not type into some other app unless the user explicitly asks to switch apps.
@@ -1520,31 +1558,27 @@ final class CompanionManager: ObservableObject {
     examples:
       user (Hindi): "फ़ाइल मेनू कहाँ है"  (where is File menu)
         screen shows: [menu:File]
-        → point_at_element(label: "File")     ✓
-        → point_at_element(label: "फ़ाइल")     ✗ won't resolve
+        → submit_workflow_plan(... steps: [{type:"observe", label:"File"}])     ✓
+        → submit_workflow_plan(... steps: [{type:"observe", label:"फ़ाइल"}])     ✗ won't resolve
 
       user (English): "open the archivo menu"
         screen shows: [menu:Archivo]
-        → point_at_element(label: "Archivo")  ✓
-        → point_at_element(label: "File")     ✗ won't resolve
+        → submit_workflow_plan(... steps: [{type:"click", label:"Archivo"}])  ✓
+        → submit_workflow_plan(... steps: [{type:"click", label:"File"}])     ✗ won't resolve
 
       user (Spanish): "donde está el botón guardar"
         screen shows: [button:Save]
-        → point_at_element(label: "Save")     ✓
-        → point_at_element(label: "Guardar")  ✗ won't resolve
+        → submit_workflow_plan(... steps: [{type:"observe", label:"Save"}])     ✓
+        → submit_workflow_plan(... steps: [{type:"observe", label:"Guardar"}])  ✗ won't resolve
 
     same rule applies for every step in submit_workflow_plan — each step's label MUST be the literal on-screen text. translate the `goal` and `hint` fields freely (those are for narration), but NEVER translate `label`.
 
     TOOL: submit_workflow_plan(goal, app, steps)
-      use for ANYTHING that requires more than one click, including:
-        - opening a menu then picking an item ("how do I save" → File → Save)
-        - navigating through panels or tabs
-        - ANY "how do I X" / "walk me through" / "show me how to" / "teach me" question
-      produce the FULL plan yourself — you see the screenshot, you know the user's request, you know the app. you DO NOT need an external planner. emit every step in order.
+      use for ANY computer action, including one-step actions. open apps, open URLs, click buttons, press shortcuts, type text, scroll, edit highlighted text, or observe/point at a visible element. produce the FULL CUA action plan yourself — you see the screenshot, you know the user's request, you know the app. you DO NOT need an external planner. emit every step in order.
       arguments:
         goal  = short summary of the user's intent ("create a new file", "render an animation").
         app   = exact foreground app name visible in the screenshot ("Blender", "Xcode", "GarageBand"). never "macOS" or "unknown".
-        steps = ordered array of {type?, label, hint, targetContext?, box_2d?}. first step MUST be visible on the current screen unless it has targetContext:"currentHighlight", targetContext:"currentSelection", or targetContext:"focusedElement". subsequent steps describe the path to take after clicking step 1.
+        steps = ordered array of {type?, label, value?, hint, targetContext?, box_2d?}. first step MUST be visible on the current screen unless it has targetContext:"currentHighlight", targetContext:"currentSelection", or targetContext:"focusedElement". subsequent steps describe the path to take after clicking step 1.
         box_2d = OPTIONAL bounding box for the step's element in [y1, x1, y2, x2] form, each value in [0, 1000] normalized to the current screenshot. origin top-left, y first. include it whenever you can on step 1 — it's how this model is natively trained to localize. ALWAYS include it for apps without accessibility (Blender, games, canvas tools).
 
     STEP TYPES (for submit_workflow_plan):
@@ -1569,16 +1603,18 @@ final class CompanionManager: ObservableObject {
         label = the shortcut combo as written (e.g. "Cmd+S", "Cmd+Shift+N", "Cmd+Space", "Return", "Escape").
         ONLY use when the action is purely a key press, not a click. examples: confirming a dialog with Return, opening Spotlight with Cmd+Space, saving with Cmd+S when the user explicitly wants the shortcut path. never use this just because there IS a shortcut — if the user can ALSO click File → Save, prefer the click steps so the user learns the menu path.
         modifier names recognized: Cmd / Command, Opt / Option / Alt, Ctrl / Control, Shift, Fn. key names: letters, digits, Space, Return, Tab, Escape, Delete, Left/Right/Up/Down, Home, End, PageUp, PageDown, F1-F12.
+        for creating a new native document/note in the current Mac app, prefer Cmd+N over clicking labels like "New Note" because sidebar/list items with similar text can be ambiguous.
 
       type: "pressKey"
         label = one key name only (e.g. "Return", "Escape", "Tab", "PageDown", "Down").
         use when no modifiers are involved.
 
       type: "type"
-        label = the literal text to type into the currently focused field.
+        value = the literal text to type into the currently focused field. label may name the target field, like "Note body".
         ONLY use after a step has focused a text field (clicking it, or a Cmd+N that opens a fresh field). NEVER chain two `type` steps — concatenate the text into one step instead.
-        do NOT translate the text. if the user said "type 'on my way'", the label is exactly `on my way`, not the user's spoken language.
-        if the user said to rewrite/change/delete/replace the current highlighted area, include targetContext:"currentHighlight" and type ONLY the replacement text.
+        do NOT translate the text. if the user said "type 'on my way'", the value is exactly `on my way`, not the user's spoken language.
+        if the user said to rewrite/change/delete/replace the current highlighted area, include targetContext:"currentHighlight" and type ONLY the replacement text in value.
+        for writing a title plus body, put the entire text in ONE type step's value with newline characters between title and paragraphs.
 
       type: "setValue"
         value = the value to set on the currently focused native AX element. use sparingly; prefer `type` for normal text fields.
@@ -1596,9 +1632,9 @@ final class CompanionManager: ObservableObject {
     LOGIN / 2FA RULE: when a workflow lands on a sign-in screen, an OAuth consent screen, or a 2FA prompt, STOP the plan there and hand off. do not auto-click "Continue" / "Allow" / "Sign in" buttons that finalize a credential exchange.
 
     ABSOLUTE RULES:
-    - exactly ONE tool call per turn. never both tools, never the same tool twice.
-    - single visible element → point_at_element.
-    - anything needing a sequence → submit_workflow_plan.
+    - exactly ONE tool call per turn. never the same tool twice.
+    - any computer control → submit_workflow_plan.
+    - for "where is it" / pointing-only requests, do not call a tool; answer conversationally from the screenshot.
     - no UI involvement (pure knowledge or chit-chat) → no tool, just speak.
 
     POST-TOOL-CALL NARRATION RULE (CRITICAL — read every time):
@@ -1619,7 +1655,7 @@ final class CompanionManager: ObservableObject {
     examples:
 
     user: "where's the File menu"
-      → point_at_element(label: "File")
+      → no tool
       → speak: "right at the top left"
 
     user: "how do I create a new file in Xcode"
@@ -1708,6 +1744,10 @@ final class CompanionManager: ObservableObject {
     }
 
     private func planForCurrentFocusHighlightIfNeeded(_ plan: WorkflowPlan) -> WorkflowPlan {
+        guard shouldBindPlanToCurrentFocusContext(plan) else {
+            return plan
+        }
+
         if let context = lastFocusHighlightContext,
            Date().timeIntervalSince(context.createdAt) < 300,
            let hoveredWindow = context.hoveredWindow,
@@ -1747,6 +1787,18 @@ final class CompanionManager: ObservableObject {
         }
 
         return plan
+    }
+
+    private func shouldBindPlanToCurrentFocusContext(_ plan: WorkflowPlan) -> Bool {
+        let hasExplicitContextStep = plan.steps.contains { step in
+            step.targetContext == .currentHighlight || step.targetContext == .currentSelection
+        }
+        guard hasExplicitContextStep else { return false }
+
+        let opensDifferentApp = plan.steps.contains { step in
+            step.type == .openApp || step.type == .openURL
+        }
+        return !opensDifferentApp
     }
 
     private func configurePendingTextReplacementRangeIfNeeded(
@@ -1839,7 +1891,7 @@ final class CompanionManager: ObservableObject {
     /// setup, so the latency cost (typically 50-300ms on Cocoa apps,
     /// up to 1s on heavy Electron trees) lands entirely in "free" time.
     /// This is the single biggest perceived-latency win on the warm
-    /// path: by the time the first `point_at_element` arrives,
+    /// path: by the time the first CUA plan arrives,
     /// resolution returns in ~10-30ms instead of 100-400ms.
     func startVoiceSession() {
         Task.detached(priority: .userInitiated) {
@@ -1856,7 +1908,7 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Walk the user's target app AX tree to prime caches so the first
-    /// `point_at_element` resolves against warm data. The set-of-marks
+    /// CUA plan resolves against warm data. The set-of-marks
     /// walk inside `setOfMarksForTargetApp` is the heaviest AX call
     /// the resolver makes at runtime, so doing it now means the first
     /// real `findElement` call is mostly cached I/O.

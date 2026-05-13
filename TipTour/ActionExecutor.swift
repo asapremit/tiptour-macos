@@ -37,6 +37,7 @@ final class ActionExecutor {
     static let shared = ActionExecutor()
 
     private let postActivationSettleSeconds: TimeInterval = 0.08
+    private let postForegroundActivationSettleSeconds: TimeInterval = 0.35
     private var pendingTextReplacementRangeByProcessIdentifier: [pid_t: CFRange] = [:]
 
     // MARK: - Public API
@@ -238,7 +239,7 @@ final class ActionExecutor {
             additionalArguments: remoteDebuggingArgumentsIfChromiumBrowser(applicationName)
         )
         if let runningApplication = NSRunningApplication(processIdentifier: launchedApplication.pid) {
-            try await activateTargetApplicationIfNeeded(runningApplication)
+            try await bringApplicationToForeground(runningApplication)
         }
         print("[ActionExecutor] CUA opened app \"\(applicationName)\" pid=\(launchedApplication.pid)")
     }
@@ -252,12 +253,12 @@ final class ActionExecutor {
                 additionalArguments: remoteDebuggingArgumentsIfChromiumBrowser(preferredApplicationName)
             )
             if let runningApplication = NSRunningApplication(processIdentifier: launchedApplication.pid) {
-                try await activateTargetApplicationIfNeeded(runningApplication)
+                try await bringApplicationToForeground(runningApplication)
             }
         } else {
             let launchedApplication = try await launchDefaultApplication(for: url)
             if let runningApplication = NSRunningApplication(processIdentifier: launchedApplication.pid) {
-                try await activateTargetApplicationIfNeeded(runningApplication)
+                try await bringApplicationToForeground(runningApplication)
             }
         }
 
@@ -326,6 +327,51 @@ final class ActionExecutor {
             targetApplication.activate()
             try await Task.sleep(nanoseconds: UInt64(postActivationSettleSeconds * 1_000_000_000))
         }
+    }
+
+    private func bringApplicationToForeground(_ targetApplication: NSRunningApplication) async throws {
+        targetApplication.unhide()
+        targetApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        try await Task.sleep(nanoseconds: UInt64(postForegroundActivationSettleSeconds * 1_000_000_000))
+        raiseMainWindowIfPossible(for: targetApplication)
+        try await Task.sleep(nanoseconds: UInt64(postActivationSettleSeconds * 1_000_000_000))
+    }
+
+    private func raiseMainWindowIfPossible(for targetApplication: NSRunningApplication) {
+        let processIdentifier = targetApplication.processIdentifier
+        guard processIdentifier > 0 else { return }
+
+        let appElement = AXUIElementCreateApplication(processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, 0.2)
+
+        if let focusedWindow = accessibilityWindowAttribute(
+            "AXFocusedWindow",
+            of: appElement
+        ) {
+            AXUIElementPerformAction(focusedWindow, kAXRaiseAction as CFString)
+            return
+        }
+
+        var windowsRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement],
+              let firstWindow = windows.first else {
+            return
+        }
+
+        AXUIElementPerformAction(firstWindow, kAXRaiseAction as CFString)
+    }
+
+    private func accessibilityWindowAttribute(
+        _ attributeName: String,
+        of element: AXUIElement
+    ) -> AXUIElement? {
+        var valueRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attributeName as CFString, &valueRef) == .success,
+              let valueRef else {
+            return nil
+        }
+        return valueRef as! AXUIElement
     }
 
     private func hasPendingTextReplacementRange(for processIdentifier: pid_t) -> Bool {

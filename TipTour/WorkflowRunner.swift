@@ -864,14 +864,8 @@ final class WorkflowRunner: ObservableObject {
                 shortcut,
                 activatingTargetApp: targetApp
             )
-            // Treat the shortcut as a "post-click" event for advance
-            // purposes — the same validator that watches for AX state
-            // change after a click works for keystrokes too.
-            preClickAccessibilityFingerprint = Self.captureAccessibilityFingerprint(
-                targetAppHint: activePlan?.app
-            )
             guard operationToken == currentOperationToken else { return }
-            advanceUsingCachedHandlers(isPostClick: true)
+            advanceUsingCachedHandlers(isPostClick: false)
         } catch {
             print("[Workflow] keyboard shortcut \"\(shortcut)\" failed: \(error.localizedDescription)")
             currentStepResolutionFailureLabel = shortcut
@@ -899,16 +893,17 @@ final class WorkflowRunner: ObservableObject {
                 activatingTargetApp: targetApp
             )
             guard operationToken == currentOperationToken else { return }
-            advanceUsingCachedHandlers(isPostClick: true)
+            advanceUsingCachedHandlers(isPostClick: false)
         } catch {
             print("[Workflow] press key \"\(keyName)\" failed: \(error.localizedDescription)")
             currentStepResolutionFailureLabel = keyName
         }
     }
 
-    /// Execute a `.type` step — types the step's `label` text into the
-    /// currently focused field. Only runs in Autopilot mode for the
-    /// same reason as keyboard shortcuts: there's nothing to point at.
+    /// Execute a `.type` step into the currently focused field. Gemini
+    /// may use `label` for the target name ("Note body") and `value`
+    /// for the actual text; prefer `value` so labels are never inserted
+    /// as content.
     private func executeTypeTextStep(
         step: WorkflowStep,
         operationToken: UUID
@@ -917,7 +912,8 @@ final class WorkflowRunner: ObservableObject {
             pause(.actionRequiresAutopilot(label: step.label ?? step.hint))
             return
         }
-        guard let textToType = step.label, !textToType.isEmpty else {
+        let textToType = step.value ?? step.label
+        guard let textToType, !textToType.isEmpty else {
             print("[Workflow] type step has no text — skipping")
             advanceUsingCachedHandlers(isPostClick: false)
             return
@@ -932,11 +928,8 @@ final class WorkflowRunner: ObservableObject {
                 textToType,
                 activatingTargetApp: targetApp
             )
-            preClickAccessibilityFingerprint = Self.captureAccessibilityFingerprint(
-                targetAppHint: activePlan?.app
-            )
             guard operationToken == currentOperationToken else { return }
-            advanceUsingCachedHandlers(isPostClick: true)
+            advanceUsingCachedHandlers(isPostClick: false)
         } catch {
             print("[Workflow] type \"\(textToType.prefix(40))…\" failed: \(error.localizedDescription)")
             currentStepResolutionFailureLabel = "type"
@@ -1032,8 +1025,7 @@ final class WorkflowRunner: ObservableObject {
                 if bundleID == Bundle.main.bundleIdentifier { return }
                 // Tolerate activations of the plan's target app — that's
                 // a legitimate part of nearly every workflow.
-                if let target = self.planTargetAppBundleID,
-                   bundleID == target {
+                if self.activationMatchesCurrentPlanTarget(activatedApp) {
                     return
                 }
                 self.pause(.userSwitchedToUnrelatedApp(bundleID: bundleID))
@@ -1046,6 +1038,33 @@ final class WorkflowRunner: ObservableObject {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
             appActivationObserver = nil
         }
+    }
+
+    private func activationMatchesCurrentPlanTarget(_ activatedApp: NSRunningApplication) -> Bool {
+        if let bundleID = activatedApp.bundleIdentifier,
+           let targetBundleID = planTargetAppBundleID,
+           bundleID == targetBundleID {
+            return true
+        }
+
+        let targetNames = [
+            activePlan?.app,
+            activeStep?.type == .openApp ? activeStep?.label : nil
+        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+
+        let activatedAppName = activatedApp.localizedName?.lowercased()
+        let activatedBundleID = activatedApp.bundleIdentifier?.lowercased()
+        let matchesTargetName = targetNames.contains { targetName in
+            activatedAppName == targetName
+                || activatedAppName?.contains(targetName) == true
+                || activatedBundleID?.contains(targetName) == true
+        }
+
+        if matchesTargetName {
+            planTargetAppBundleID = activatedApp.bundleIdentifier
+        }
+
+        return matchesTargetName
     }
 
     // MARK: - Modal Dialog Detection

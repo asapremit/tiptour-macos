@@ -166,44 +166,12 @@ final class GeminiLiveClient: @unchecked Sendable {
         // response modalities (audio + text transcriptions), system instruction,
         // automatic voice activity detection, AND the tools Gemini can call.
         //
-        // Two tools are declared:
-        //   - point_at_element(label): single-element pointing for "where's X"
-        //     type questions. Fast path — resolves locally via AX + YOLO.
-        //   - create_workflow(goal): multi-step plan generation for "how do I X"
-        //     walkthroughs. Runs the separate planner model which returns a
-        //     JSON plan the voice then narrates in sync.
-        //
-        // Gemini chooses which tool to call based on the user's request. This
-        // replaces the brittle [POINT:] tag parsing from spoken transcripts.
-        let pointAtElementTool: [String: Any] = [
-            "name": "point_at_element",
-            "description": "Fly the cursor to a single visible UI element on the user's screen. Use for simple 'where is X' / 'point at X' questions where ONE element is all that's needed and it's visible right now.",
-            "parameters": [
-                "type": "object",
-                "properties": [
-                    "label": [
-                        "type": "string",
-                        "description": "The literal visible text of the element — e.g. 'Save', 'File', 'Source Control'. Use the actual text on screen, not a description."
-                    ],
-                    "box_2d": [
-                        "type": "array",
-                        "description": "Optional bounding box for the element in normalized [y1, x1, y2, x2] form, each value in [0, 1000] relative to the screenshot. RECOMMENDED for apps without accessibility (Blender, games, canvas tools) and for ambiguous labels. Origin is top-left, y comes first.",
-                        "items": ["type": "integer"],
-                        "minItems": 4,
-                        "maxItems": 4
-                    ]
-                ],
-                "required": ["label"]
-            ]
-        ]
-        // submit_workflow_plan folds the old planner model into this
-        // single tool call. Gemini Live has vision + reasoning; it can
-        // produce the plan itself without a second round-trip to a
-        // separate planner API. The cursor moves the moment the tool
-        // call arrives, in perfect sync with the speech that follows.
+        // One action tool is declared. Gemini Live has vision +
+        // reasoning, so it produces the CUA action plan itself without
+        // a second planner model or a separate point-at-element path.
         let submitWorkflowPlanTool: [String: Any] = [
             "name": "submit_workflow_plan",
-            "description": "For any multi-step walkthrough (opening a menu then picking an item, 'how do I X', 'walk me through Y', 'teach me Z'). Emit the FULL plan of steps as a structured argument. Gemini narrates each step after the tool returns, while the cursor flies through them in order.",
+            "description": "Submit a CUA action plan for anything the user wants done on the computer: open apps, open URLs, click UI, press shortcuts, type text, edit highlighted/selected content, or scroll. Use this for both one-step and multi-step actions.",
             "parameters": [
                 "type": "object",
                 "properties": [
@@ -223,7 +191,7 @@ final class GeminiLiveClient: @unchecked Sendable {
                             "properties": [
                                 "label": [
                                     "type": "string",
-                                    "description": "For click: literal visible text of the element, or nearest label for an icon. For openApp: app name, e.g. 'Safari'. For openURL: URL/path, e.g. 'https://apple.com' or '/Users/me/Desktop'. For keyboardShortcut: combo. For type: text to type."
+                                    "description": "For click: literal visible text of the element, or nearest label for an icon. For openApp: app name, e.g. 'Safari'. For openURL: URL/path, e.g. 'https://apple.com' or '/Users/me/Desktop'. For keyboardShortcut: combo. For type: target field label, e.g. 'Note body'."
                                 ],
                                 "type": [
                                     "type": "string",
@@ -249,7 +217,7 @@ final class GeminiLiveClient: @unchecked Sendable {
                                 ],
                                 "value": [
                                     "type": "string",
-                                    "description": "Value for setValue steps. For type steps, prefer label unless a separate value is clearer."
+                                    "description": "Value for setValue steps. For type steps, put the literal text to type here; use label only for the target field name."
                                 ],
                                 "direction": [
                                     "type": "string",
@@ -332,7 +300,7 @@ final class GeminiLiveClient: @unchecked Sendable {
                     ]
                 ],
                 "tools": [
-                    ["functionDeclarations": [pointAtElementTool, submitWorkflowPlanTool]]
+                    ["functionDeclarations": [submitWorkflowPlanTool]]
                 ]
             ]
         ]
@@ -599,8 +567,8 @@ final class GeminiLiveClient: @unchecked Sendable {
             return
         }
 
-        // 3. Tool call — Gemini wants us to run one of the registered tools
-        //    (point_at_element or create_workflow). Its turn is paused until
+        // 3. Tool call — Gemini wants us to run the registered CUA plan tool.
+        //    Its turn is paused until
         //    we reply via sendToolResponse.
         if let toolCall = json["toolCall"] as? [String: Any],
            let functionCalls = toolCall["functionCalls"] as? [[String: Any]] {

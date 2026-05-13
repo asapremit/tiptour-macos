@@ -332,14 +332,11 @@ final class ElementResolver: @unchecked Sendable {
         }
     }
 
-    /// Worker base URL — kept in sync with CompanionManager's via the
-    /// override hook below. CompanionManager calls
-    /// `ElementResolver.workerBaseURLOverride = ...` at launch so we
-    /// don't have to re-implement the build-config plumbing here.
+    /// Optional Worker base URL — set by CompanionManager from bundle
+    /// config for distributed builds. Source builds leave this nil so
+    /// they never hit the maintainer's Cloudflare Worker.
     nonisolated(unsafe) static var workerBaseURLOverride: String?
-    /// Fallback if no override has been set yet (very early calls).
-    /// Matches CompanionManager.workerBaseURL by convention.
-    private static let defaultWorkerBaseURL: String? = "https://clicky-proxy.milindsoni201.workers.dev"
+    private static let defaultWorkerBaseURL: String? = nil
 
     // MARK: - Coordinate Conversion
 

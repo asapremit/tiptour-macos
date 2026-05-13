@@ -4,7 +4,8 @@
 //
 //  SwiftUI content hosted inside the menu bar panel. Minimal layout:
 //  status header, permissions setup or hotkey hint, optional workflow
-//  checklist, neko toggle, developer section, footer. Dark aesthetic via DS.
+//  checklist, API key setup, toggles, developer section, footer.
+//  Dark aesthetic via DS.
 //
 
 import AVFoundation
@@ -23,6 +24,10 @@ struct CompanionPanelView: View {
 
             permissionsCopySection
                 .padding(.top, 16)
+                .padding(.horizontal, 16)
+
+            Spacer().frame(height: 12)
+            geminiAPIKeySection
                 .padding(.horizontal, 16)
 
             if companionManager.isMultiStepTourGuideEnabled,
@@ -738,7 +743,60 @@ struct CompanionPanelView: View {
         }
     }
 
-    // MARK: - Developer (bring-your-own-key)
+    // MARK: - Gemini API Key
+
+    @State private var devGeminiKeyInput: String = ""
+    @State private var devGeminiKeyStatus: String = ""
+
+    private var geminiAPIKeySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "key.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(hasSavedGeminiKey ? DS.Colors.accent : DS.Colors.warning)
+
+                Text("Gemini API key")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                Spacer()
+
+                Text(hasSavedGeminiKey ? "Saved" : "Required")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(hasSavedGeminiKey ? DS.Colors.success : DS.Colors.warning)
+            }
+
+            byokKeyRow(
+                title: "Key",
+                placeholder: "AIzaSy…",
+                input: $devGeminiKeyInput,
+                save: {
+                    KeychainStore.geminiAPIKey = devGeminiKeyInput
+                },
+                clear: {
+                    devGeminiKeyInput = ""
+                    KeychainStore.geminiAPIKey = nil
+                },
+                status: $devGeminiKeyStatus,
+                hasSavedKey: hasSavedGeminiKey
+            )
+            .padding(.horizontal, -10)
+
+            if !devGeminiKeyStatus.isEmpty {
+                Text(devGeminiKeyStatus)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .transition(.opacity)
+            }
+        }
+        .onAppear {
+            devGeminiKeyInput = KeychainStore.geminiAPIKey ?? ""
+        }
+    }
+
+    private var hasSavedGeminiKey: Bool {
+        !(KeychainStore.geminiAPIKey ?? "").isEmpty
+    }
 
     // MARK: - Footer
 
@@ -814,15 +872,9 @@ struct CompanionPanelView: View {
 
     // MARK: - Dev Tools
 
-    /// Always-visible. Shipping users get the voice-backend picker and
-    /// bring-your-own-key fields here so they can switch models or wire
-    /// in their own OpenAI / Gemini key without rebuilding from source.
-    /// The detection-overlay / cursor-flight / reset-all rows below are
-    /// still gated by `#if DEBUG` because they're internal-only and
-    /// have no use to a casual user.
+    /// Internal debug rows. The Gemini key entry is intentionally exposed
+    /// in the normal panel setup instead of being hidden here.
     @State private var showDevTools: Bool = false
-    @State private var devGeminiKeyInput: String = ""
-    @State private var devGeminiKeyStatus: String = ""
 
     /// One-line bring-your-own-key row. Icon + label on the left, a
     /// SecureField that grows to fill, and a single trailing icon button
@@ -922,38 +974,6 @@ struct CompanionPanelView: View {
             Spacer().frame(height: 6)
             #endif
 
-            sectionHeader("API KEYS (optional)")
-
-            byokKeyRow(
-                title: "Gemini",
-                placeholder: "AIzaSy…",
-                input: $devGeminiKeyInput,
-                save: {
-                    KeychainStore.geminiAPIKey = devGeminiKeyInput
-                },
-                clear: {
-                    devGeminiKeyInput = ""
-                    KeychainStore.geminiAPIKey = nil
-                },
-                status: $devGeminiKeyStatus,
-                hasSavedKey: !(KeychainStore.geminiAPIKey ?? "").isEmpty
-            )
-
-            // Save/clear status text — auto-clears after a beat.
-            if !devGeminiKeyStatus.isEmpty {
-                Text(devGeminiKeyStatus)
-                    .font(.system(size: 10))
-                    .foregroundColor(DS.Colors.textTertiary)
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 4)
-                    .transition(.opacity)
-            }
-        }
-        .onAppear {
-            // Pre-populate the field from Keychain so the user can see
-            // whether a key is already saved (revealed as dots in the
-            // SecureField).
-            devGeminiKeyInput = KeychainStore.geminiAPIKey ?? ""
         }
         .padding(.vertical, 4)
     }

@@ -8,7 +8,7 @@
 //       and streams it over the WebSocket
 //    3. Sends a screenshot at session start so Gemini can see the screen
 //    4. Plays back audio responses in real time via GeminiLiveAudioPlayer
-//    5. Routes Gemini's tool calls (point_at_element, submit_workflow_plan)
+//    5. Routes Gemini's CUA action plan tool calls
 //       to CompanionManager via callbacks
 //
 
@@ -63,14 +63,8 @@ final class GeminiLiveSession: ObservableObject {
     /// Fires on fatal errors so the caller can surface them to the user.
     var onError: ((Error) -> Void)?
 
-    /// Fired when Gemini calls `point_at_element(label, box_2d?)`. The handler
-    /// must resolve the label to a screen position, point the cursor there, and
-    /// return a short dictionary describing the result. That dictionary is
-    /// sent back to Gemini as the tool response so it can continue narrating
-    /// with knowledge of what was pointed at. `box2DNormalized` is Gemini's
-    /// optional bounding box in [y1, x1, y2, x2] form, each value in [0, 1000]
-    /// relative to the screenshot Gemini saw last; nil when Gemini didn't
-    /// supply one (e.g. it's confident the AX label resolves on its own).
+    /// Legacy handler for older Gemini sessions that still call the removed
+    /// point tool. New sessions only declare `submit_workflow_plan`.
     var onPointAtElement: ((_ id: String, _ label: String, _ box2DNormalized: [Int]?, _ screenshotJPEG: Data?) async -> [String: Any])?
 
     /// Fired when Gemini calls `submit_workflow_plan(goal, app, steps)`.
@@ -99,9 +93,10 @@ final class GeminiLiveSession: ObservableObject {
     private var audioEngine = AVAudioEngine()
     private let pcm16Converter = BuddyPCM16AudioConverter(targetSampleRate: GeminiLiveClient.inputSampleRate)
 
-    /// Where to fetch the Gemini API key. Points to the Worker's
-    /// /gemini-live-key endpoint.
-    private let apiKeyURL: URL
+    /// Optional Worker endpoint for distributed builds. Source builds
+    /// leave this nil and require a local Keychain Gemini key.
+    private let apiKeyURL: URL?
+    private var cachedWorkerAPIKey: String?
 
     /// The system prompt given to Gemini. Keeps POINT-tag behavior identical
     /// to the existing Claude flow so the cursor pointing keeps working.
@@ -154,8 +149,8 @@ final class GeminiLiveSession: ObservableObject {
 
     // MARK: - Init
 
-    init(apiKeyURL: String, systemPrompt: String) {
-        self.apiKeyURL = URL(string: apiKeyURL)!
+    init(apiKeyURL: String?, systemPrompt: String) {
+        self.apiKeyURL = apiKeyURL.flatMap(URL.init(string:))
         self.systemPrompt = systemPrompt
 
         geminiClient.onEvent = { [weak self] event in
@@ -214,14 +209,6 @@ final class GeminiLiveSession: ObservableObject {
         // suppress the initial screenshot Gemini needs to see).
         lastSentScreenshotHashByScreenLabel.removeAll()
 
-        // Initial frame capture + send to Gemini so it has visual context
-        // for the user's first utterance. Local resolver warmup (YOLO/OCR
-        // + AX tree) runs in parallel from CompanionManager the moment the
-        // hotkey fires, so both caches are already hot by the time we get
-        // here — we just need Gemini to see the same frame.
-        _ = initialScreenshot
-        await captureAndProcessFrameForGemini()
-
         try startMicCapture()
 
         // The player is now attached to the same engine that startMicCapture
@@ -234,6 +221,14 @@ final class GeminiLiveSession: ObservableObject {
         hasReceivedUserSpeechThisSession = false
 
         startPeriodicScreenshotUpdates()
+
+        // Send visual context after the mic is live so the user can start
+        // speaking as soon as Gemini setup completes. This avoids making
+        // the hotkey feel blocked on ScreenCaptureKit/JPEG work.
+        _ = initialScreenshot
+        Task { @MainActor in
+            await captureAndProcessFrameForGemini()
+        }
 
         print("[GeminiLiveSession] Session started")
     }
@@ -306,8 +301,8 @@ final class GeminiLiveSession: ObservableObject {
 
     /// Mark that a tool call was just satisfied, so subsequent
     /// screenshot pushes should be suppressed until the user speaks.
-    /// CompanionManager calls this after a successful point_at_element
-    /// or submit_workflow_plan. The flag self-clears on the next
+    /// CompanionManager calls this after a successful CUA action plan.
+    /// The flag self-clears on the next
     /// inputTranscript chunk (i.e. the user spoke).
     func suppressScreenshotsUntilUserSpeaks() {
         guard isActive else { return }
@@ -470,8 +465,8 @@ final class GeminiLiveSession: ObservableObject {
         // network sends.
         latestCapture = primaryCapture
 
-        // After ANY successful tool call (point_at_element or
-        // submit_workflow_plan), suppress screenshot pushes until the
+        // After any successful CUA action plan, suppress screenshot
+        // pushes until the
         // user speaks again. Without this, Gemini sees frames showing
         // "user hasn't acted yet" and re-emits the same tool call in
         // a tight loop. Mic stays live so the moment the user actually
@@ -563,18 +558,28 @@ final class GeminiLiveSession: ObservableObject {
 
     // MARK: - API Key Fetch
 
-    /// Resolve the Gemini API key. Two modes:
-    ///   1. Bring-your-own-key (source-build flow): user has pasted a
-    ///      key into the panel's Developer section; it's stored in
-    ///      Keychain. We return it directly and never hit the Worker.
-    ///   2. Worker proxy (shipped-DMG flow): no user-provided key, so
-    ///      we GET /gemini-live-key on the hardcoded Worker URL, which
-    ///      returns the key from the Worker's secret store.
+    /// Resolve the Gemini API key. Source builds use only the user's
+    /// Keychain key. Distributed builds may provide TipTourWorkerBaseURL
+    /// in Info.plist to enable a Worker fallback.
     private func fetchAPIKey() async throws -> String {
         if let userKey = KeychainStore.geminiAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines),
            !userKey.isEmpty {
             print("[GeminiLiveSession] Using Gemini API key from Keychain (bring-your-own-key mode)")
             return userKey
+        }
+
+        guard let apiKeyURL else {
+            throw NSError(
+                domain: "GeminiLiveSession",
+                code: -9,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "No Gemini API key saved. Paste your own Gemini API key in the TipTour panel to use this source build."
+                ]
+            )
+        }
+
+        if let cachedWorkerAPIKey {
+            return cachedWorkerAPIKey
         }
 
         var request = URLRequest(url: apiKeyURL)
@@ -586,7 +591,7 @@ final class GeminiLiveSession: ObservableObject {
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             throw NSError(domain: "GeminiLiveSession", code: -10,
-                          userInfo: [NSLocalizedDescriptionKey: "Failed to fetch Gemini API key from Worker (\(apiKeyURL.absoluteString)). For source builds, paste a key in the panel's Developer section instead."])
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to fetch Gemini API key from Worker (\(apiKeyURL.absoluteString)). Paste a key in the TipTour panel or check the Worker configuration."])
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -595,6 +600,7 @@ final class GeminiLiveSession: ObservableObject {
                           userInfo: [NSLocalizedDescriptionKey: "Invalid API key response"])
         }
 
+        cachedWorkerAPIKey = apiKey
         return apiKey
     }
 
@@ -739,9 +745,9 @@ final class GeminiLiveSession: ObservableObject {
 
         case .outputTranscript:
             // Output transcript is only useful for debugging now that the
-            // legacy [POINT:] tag fallback is gone — Gemini's pointing
-            // intent comes through tool calls (point_at_element /
-            // submit_workflow_plan), not embedded markers in spoken text.
+            // legacy [POINT:] tag fallback is gone — Gemini's computer
+            // control intent comes through submit_workflow_plan, not
+            // embedded markers in spoken text.
             // Discard the chunk; the audio player handles user-facing
             // narration directly.
             break

@@ -63,7 +63,7 @@ TipTour needs macOS permissions to work:
 | Accessibility | Reading UI structure and controlling apps |
 | Screen Content | ScreenCaptureKit capture |
 
-API keys are handled through the Cloudflare Worker proxy for distribution builds. Local development can also use a developer Gemini key stored in Keychain.
+Source builds require your own Gemini API key. Paste it into the visible “Gemini API key” field in the menu bar panel; TipTour stores it in macOS Keychain.
 
 ## Build From Source
 
@@ -84,13 +84,14 @@ Then in Xcode:
 1. Select the `TipTour` scheme.
 2. Set your signing team.
 3. Press `Cmd+R`.
-4. Grant the requested macOS permissions.
+4. Paste your Gemini API key into the panel.
+5. Grant the requested macOS permissions.
 
 Do not build with terminal `xcodebuild` if you are actively testing permissions, because it can invalidate local TCC permission state.
 
 ## Worker
 
-The app uses a Cloudflare Worker proxy so production builds do not ship API secrets.
+The Worker is optional for distribution builds. Source builds do not use the maintainer's Worker URL. To ship your own Worker-backed build, deploy the Worker and set `TipTourWorkerBaseURL` in the app bundle/build settings.
 
 ```bash
 cd worker

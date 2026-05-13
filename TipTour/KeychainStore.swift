@@ -96,10 +96,9 @@ enum KeychainStore {
 
     // MARK: - TipTour-specific keys
 
-    /// Gemini API key the user has pasted directly into the app
-    /// (bring-your-own-key mode for source builds). When present,
-    /// GeminiLiveSession uses it directly instead of fetching from
-    /// the Cloudflare Worker proxy.
+    /// Gemini API key the user has pasted directly into the app.
+    /// Source builds require this local Keychain key. Distributed
+    /// builds may optionally fall back to a configured Worker proxy.
     static var geminiAPIKey: String? {
         get { get(forKey: "geminiAPIKey") }
         set { set(newValue ?? "", forKey: "geminiAPIKey") }

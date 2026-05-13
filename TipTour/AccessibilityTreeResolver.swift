@@ -77,7 +77,7 @@ final class AccessibilityTreeResolver: @unchecked Sendable {
     /// Walk the target app's AX tree and return a compact list of
     /// pointable elements for set-of-marks prompting. Gemini gets these
     /// labels alongside each screenshot so it can reference them
-    /// verbatim in `point_at_element`/`submit_workflow_plan` calls
+    /// verbatim in `submit_workflow_plan` step labels
     /// rather than guessing pixel coordinates. This is the biggest
     /// single accuracy lever for apps with good AX support.
     ///
