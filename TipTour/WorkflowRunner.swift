@@ -190,7 +190,7 @@ final class WorkflowRunner: ObservableObject {
 
     // MARK: - Start / Stop
 
-    /// Begin executing a plan. Resolves and points at step 1 immediately,
+    /// Begin executing one action. Resolves and points at step 1 immediately,
     /// using a freshly-captured screenshot rather than whatever was
     /// cached from Gemini Live's periodic updates. `pointHandler` is the
     /// closure that actually moves the cursor — injected so
@@ -205,10 +205,22 @@ final class WorkflowRunner: ObservableObject {
             return
         }
 
+        let singleActionPlan: WorkflowPlan
+        if plan.steps.count > 1 {
+            print("[Workflow] ✂️ single-action mode: clamping \"\(plan.goal)\" from \(plan.steps.count) steps to 1")
+            singleActionPlan = WorkflowPlan(
+                goal: plan.goal,
+                app: plan.app,
+                steps: Array(plan.steps.prefix(1))
+            )
+        } else {
+            singleActionPlan = plan
+        }
+
         activeStepResolutionTask?.cancel()
         let freshOperationToken = UUID()
         currentOperationToken = freshOperationToken
-        activePlan = plan
+        activePlan = singleActionPlan
         activeStepIndex = 0
         currentStepResolutionFailureLabel = nil
         pausedReason = nil
@@ -217,9 +229,9 @@ final class WorkflowRunner: ObservableObject {
         // Fresh plan — no prior step to bias toward, no fingerprint yet.
         previousStepResolvedGlobalScreenPoint = nil
         preClickAccessibilityFingerprint = nil
-        planTargetAppBundleID = Self.bundleIDForAppName(plan.app)
+        planTargetAppBundleID = Self.bundleIDForAppName(singleActionPlan.app)
         startObservingAppActivationsForCurrentPlan()
-        print("[Workflow] starting \"\(plan.goal)\" — \(plan.steps.count) step(s) — token=\(freshOperationToken.uuidString.prefix(8))")
+        print("[Workflow] starting \"\(singleActionPlan.goal)\" — \(singleActionPlan.steps.count) step(s) — token=\(freshOperationToken.uuidString.prefix(8))")
 
         // For step 1 the incoming `latestCapture` can be several seconds
         // stale (Gemini Live's periodic screenshot timer stops when we
@@ -414,6 +426,10 @@ final class WorkflowRunner: ObservableObject {
     private func shouldBypassPostClickValidator(plan: WorkflowPlan) -> Bool {
         guard let currentStep = activeStep else { return false }
 
+        if shouldSkipAccessibilityResolution(for: plan.app) {
+            return true
+        }
+
         // Context menus often do not mutate the target app's AX
         // fingerprint because the menu is represented outside the
         // app window. Let the next step resolve the menu item instead
@@ -599,20 +615,25 @@ final class WorkflowRunner: ObservableObject {
 
             // Pass 1: poll AX with a short budget. This is the fast path
             // for native apps and Electron — usually resolves in <100ms.
-            if let axResolution = await ElementResolver.shared.pollAccessibilityTree(
-                label: label,
-                targetAppHint: activePlan?.app,
-                timeoutSeconds: axPollTimeoutPerAttemptSeconds
-            ) {
-                if Task.isCancelled { return }
-                if operationToken != currentOperationToken { return }
-                armCursorAndClickDetector(
-                    with: axResolution,
-                    pickingFrom: latestAllCaptures,
-                    stepType: activeStep?.type ?? .click,
-                    operationToken: operationToken
-                )
-                return
+            // Canvas/no-AX apps like Blender skip this entirely so we
+            // don't waste time repeatedly querying an empty tree before
+            // using Gemini's box_2d.
+            if !shouldSkipAccessibilityResolution(for: activePlan?.app) {
+                if let axResolution = await ElementResolver.shared.pollAccessibilityTree(
+                    label: label,
+                    targetAppHint: activePlan?.app,
+                    timeoutSeconds: axPollTimeoutPerAttemptSeconds
+                ) {
+                    if Task.isCancelled { return }
+                    if operationToken != currentOperationToken { return }
+                    armCursorAndClickDetector(
+                        with: axResolution,
+                        pickingFrom: latestAllCaptures,
+                        stepType: activeStep?.type ?? .click,
+                        operationToken: operationToken
+                    )
+                    return
+                }
             }
 
             // Pass 2: refresh the screenshot (app may have redrawn since
@@ -684,9 +705,9 @@ final class WorkflowRunner: ObservableObject {
         // BEFORE the click happens. After the click fires advance, we'll
         // compare the post-click fingerprint to detect the click missed
         // (no-op) versus actually transitioned the UI.
-        preClickAccessibilityFingerprint = Self.captureAccessibilityFingerprint(
-            targetAppHint: activePlan?.app
-        )
+        preClickAccessibilityFingerprint = shouldSkipAccessibilityResolution(for: activePlan?.app)
+            ? nil
+            : Self.captureAccessibilityFingerprint(targetAppHint: activePlan?.app)
 
         let isAutopilotEnabled = isAutopilotEnabledProvider?() ?? false
         if isAutopilotEnabled {
@@ -1211,6 +1232,19 @@ final class WorkflowRunner: ObservableObject {
         // advance.
         let joined = triples.joined(separator: "\n")
         return String(joined.hashValue)
+    }
+
+    private func shouldSkipAccessibilityResolution(for appHint: String?) -> Bool {
+        if Self.shouldTreatAsRawVisionOnlyApp(appHint) {
+            return true
+        }
+        return AccessibilityTreeResolver.isAppKnownToLackAXTree(hint: appHint)
+    }
+
+    private static func shouldTreatAsRawVisionOnlyApp(_ appHint: String?) -> Bool {
+        guard let normalizedAppHint = appHint?.lowercased() else { return false }
+        return normalizedAppHint.contains("blender")
+            || normalizedAppHint.contains("org.blenderfoundation.blender")
     }
 
     // MARK: - Helpers

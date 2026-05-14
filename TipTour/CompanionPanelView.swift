@@ -971,6 +971,14 @@ struct CompanionPanelView: View {
                 NotificationCenter.default.post(name: .tipTourDismissPanel, object: nil)
             }
 
+            devToolRow("Detection + OCR Overlay", systemImage: "viewfinder") {
+                companionManager.setDetectionOverlayEnabled(!companionManager.isDetectionOverlayEnabled)
+                NotificationCenter.default.post(name: .tipTourDismissPanel, object: nil)
+            } trailing: {
+                Text(companionManager.isDetectionOverlayEnabled ? "On" : "Off")
+                    .foregroundColor(companionManager.isDetectionOverlayEnabled ? DS.Colors.success : DS.Colors.textTertiary)
+            }
+
             Spacer().frame(height: 6)
             #endif
 

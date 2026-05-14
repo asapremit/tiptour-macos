@@ -43,6 +43,14 @@ final class CompanionManager: ObservableObject {
     /// Custom speech bubble text for the pointing animation.
     @Published var detectedElementBubbleText: String?
 
+    /// Debug-only visual overlay for the restored native CoreML/Vision
+    /// detector. This is deliberately not sent to Gemini yet.
+    @Published var isDetectionOverlayEnabled: Bool = false
+    @Published var detectionOverlayElements: [[String: Any]] = []
+    @Published var detectionOverlayImageSize: [Int] = [1512, 982]
+    @Published var detectionOverlayDisplayFrame: CGRect?
+    @Published var detectionOverlayHighlightedLabel: String?
+
     /// Whether the blue cursor overlay is currently visible on screen.
     @Published private(set) var isOverlayVisible: Bool = false
 
@@ -74,6 +82,7 @@ final class CompanionManager: ObservableObject {
     private var accessibilityCheckTimer: Timer?
     private var voiceAudioPowerCancellable: AnyCancellable?
     private var voiceModelSpeakingCancellable: AnyCancellable?
+    private var detectionOverlayTask: Task<Void, Never>?
 
     /// True when all four required permissions (accessibility, screen recording,
     /// microphone, screen content) are granted. Used by the panel to show a single "all good" state.
@@ -150,7 +159,7 @@ final class CompanionManager: ObservableObject {
             }
     }
 
-    // MARK: - box_2d → screenshot-pixel conversion
+    // MARK: - Gemini spatial hints → screenshot-pixel conversion
 
     /// Convert Gemini's `box_2d` (in normalized [y1, x1, y2, x2] form, each
     /// value in [0, 1000]) to the box's center in screenshot-pixel space.
@@ -183,6 +192,28 @@ final class CompanionManager: ObservableObject {
 
         let pixelX = centerNormX * screenshotWidth / 1000
         let pixelY = centerNormY * screenshotHeight / 1000
+        return CGPoint(x: pixelX, y: pixelY)
+    }
+
+    /// Convert Gemini's optional `point_2d` click target (normalized [y, x])
+    /// into screenshot-pixel space. We prefer this over the center of
+    /// `box_2d` when present because dense UI can produce wide/merged boxes
+    /// whose center is not the actual clickable target.
+    private func pixelHintFromPoint2D(
+        point2DNormalized: [Int]?,
+        capture: CompanionScreenCapture?
+    ) -> CGPoint? {
+        guard let point = point2DNormalized, point.count == 2, let capture else {
+            return nil
+        }
+
+        let yNorm = CGFloat(point[0])
+        let xNorm = CGFloat(point[1])
+        let screenshotWidth = CGFloat(capture.screenshotWidthInPixels)
+        let screenshotHeight = CGFloat(capture.screenshotHeightInPixels)
+
+        let pixelX = xNorm * screenshotWidth / 1000
+        let pixelY = yNorm * screenshotHeight / 1000
         return CGPoint(x: pixelX, y: pixelY)
     }
 
@@ -357,11 +388,15 @@ final class CompanionManager: ObservableObject {
             let hint = raw["hint"] as? String ?? ""
             let type = WorkflowStep.StepType.normalized(from: raw["type"] as? String)
 
-            // Convert Gemini's box_2d ([y1, x1, y2, x2] in [0, 1000]) to
-            // the box's center in screenshot-pixel space. The resolver's
-            // box_2d-fallback tier expects pixel coords.
+            // Prefer Gemini's exact point_2d when present. Fall back to
+            // box_2d center so older sessions and box-only model outputs
+            // keep working.
+            let point2DNormalized = (raw["point_2d"] as? [Int]).flatMap { $0.count == 2 ? $0 : nil }
             let box2DNormalized = (raw["box_2d"] as? [Int]).flatMap { $0.count == 4 ? $0 : nil }
-            let pixelCenter = pixelHintFromBox2D(
+            let pixelCenter = pixelHintFromPoint2D(
+                point2DNormalized: point2DNormalized,
+                capture: captureForBoxConversion
+            ) ?? pixelHintFromBox2D(
                 box2DNormalized: box2DNormalized,
                 capture: captureForBoxConversion
             )
@@ -386,14 +421,19 @@ final class CompanionManager: ObservableObject {
                 screenNumber: nil
             )
         }
-        let parsedSteps = normalizedWorkflowSteps(
+        let normalizedSteps = normalizedWorkflowSteps(
             parsedStepsBeforeNormalization,
             targetAppName: app
         )
 
-        guard !parsedSteps.isEmpty else {
+        guard !normalizedSteps.isEmpty else {
             print("[Tool] ✗ submit_workflow_plan — zero steps")
             return ["ok": false, "reason": "empty_steps"]
+        }
+
+        let parsedSteps = Array(normalizedSteps.prefix(1))
+        if normalizedSteps.count > parsedSteps.count {
+            print("[Tool] ✂️ single-action mode: ignoring \(normalizedSteps.count - parsedSteps.count) extra step(s)")
         }
 
         guard isAutopilotEnabled || isMultiStepTourGuideEnabled else {
@@ -429,6 +469,7 @@ final class CompanionManager: ObservableObject {
         return [
             "ok": true,
             "accepted_steps": stepLabels.count,
+            "ignored_steps": max(0, normalizedSteps.count - parsedSteps.count),
             "tour_guide_enabled": isMultiStepTourGuideEnabled
         ]
     }
@@ -682,6 +723,7 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        stopNativeDetectionOverlay()
         globalPushToTalkShortcutMonitor.stop()
         globalHighlightShortcutMonitor.stop()
         overlayWindowManager.hideOverlay()
@@ -697,6 +739,73 @@ final class CompanionManager: ObservableObject {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
+    }
+
+    // MARK: - Native Detection Overlay
+
+    func setDetectionOverlayEnabled(_ enabled: Bool) {
+        isDetectionOverlayEnabled = enabled
+
+        if enabled {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+            startNativeDetectionOverlay()
+        } else {
+            stopNativeDetectionOverlay()
+        }
+    }
+
+    private func startNativeDetectionOverlay() {
+        detectionOverlayTask?.cancel()
+        detectionOverlayTask = Task { [weak self] in
+            guard let self else { return }
+            let detectionOverlayRefreshIntervalNanoseconds: UInt64 = 800_000_000
+
+            while !Task.isCancelled {
+                do {
+                    let mouseLocation = NSEvent.mouseLocation
+                    let cursorScreen = NSScreen.screens.first { $0.frame.contains(mouseLocation) } ?? NSScreen.main
+                    let capturedImage = try await CompanionScreenCaptureUtility.capturePrimaryScreenAsCGImage()
+                    let detectedElements = await NativeElementDetector.shared.detectElements(in: capturedImage)
+                    let overlayElements = detectedElements.map { detectedElement in
+                        [
+                            "bbox": [
+                                Int(detectedElement.bbox.minX),
+                                Int(detectedElement.bbox.minY),
+                                Int(detectedElement.bbox.maxX),
+                                Int(detectedElement.bbox.maxY)
+                            ],
+                            "center": [
+                                Int(detectedElement.center.x),
+                                Int(detectedElement.center.y)
+                            ],
+                            "conf": detectedElement.confidence,
+                            "label": detectedElement.label,
+                            "source": detectedElement.source
+                        ] as [String: Any]
+                    }
+
+                    guard !Task.isCancelled else { return }
+                    detectionOverlayElements = overlayElements
+                    detectionOverlayImageSize = [capturedImage.width, capturedImage.height]
+                    detectionOverlayDisplayFrame = cursorScreen?.frame
+                } catch {
+                    print("[NativeDetector] overlay capture failed: \(error.localizedDescription)")
+                }
+
+                try? await Task.sleep(nanoseconds: detectionOverlayRefreshIntervalNanoseconds)
+            }
+        }
+    }
+
+    private func stopNativeDetectionOverlay() {
+        detectionOverlayTask?.cancel()
+        detectionOverlayTask = nil
+        isDetectionOverlayEnabled = false
+        detectionOverlayElements = []
+        detectionOverlayDisplayFrame = nil
+        detectionOverlayHighlightedLabel = nil
     }
 
     // MARK: - Permissions
@@ -1092,7 +1201,7 @@ final class CompanionManager: ObservableObject {
             lines.append(screenshotRectDescription)
         }
 
-        lines.append("when editing, prefer the accessibility element or text field intersecting this region; if needed, click inside the region first, then use CUA actions to type, set value, press keys, or modify the focused control.")
+        lines.append("when editing, prefer the accessibility element or text field intersecting this region; choose exactly one next action, such as clicking inside the region or typing into an already focused/highlighted range.")
         return lines.joined(separator: "\n")
     }
 
@@ -1574,12 +1683,14 @@ final class CompanionManager: ObservableObject {
     same rule applies for every step in submit_workflow_plan — each step's label MUST be the literal on-screen text. translate the `goal` and `hint` fields freely (those are for narration), but NEVER translate `label`.
 
     TOOL: submit_workflow_plan(goal, app, steps)
-      use for ANY computer action, including one-step actions. open apps, open URLs, click buttons, press shortcuts, type text, scroll, edit highlighted text, or observe/point at a visible element. produce the FULL CUA action plan yourself — you see the screenshot, you know the user's request, you know the app. you DO NOT need an external planner. emit every step in order.
+      use for ANY computer action. open one app, open one URL, click one button/menu/item, press one shortcut, type text into the focused/highlighted target, scroll once, edit highlighted text, or observe/point at one visible element.
+      SINGLE-ACTION MODE IS CRITICAL: emit exactly ONE step. never emit a chain like File → New → File, Add → Mesh → Cylinder, click field → type → press Return, or any other sequence. if the user's request requires a sequence, choose only the next visible/actionable step from the current screen, then wait for the next user utterance/screen state before doing the following step.
       arguments:
         goal  = short summary of the user's intent ("create a new file", "render an animation").
         app   = exact foreground app name visible in the screenshot ("Blender", "Xcode", "GarageBand"). never "macOS" or "unknown".
-        steps = ordered array of {type?, label, value?, hint, targetContext?, box_2d?}. first step MUST be visible on the current screen unless it has targetContext:"currentHighlight", targetContext:"currentSelection", or targetContext:"focusedElement". subsequent steps describe the path to take after clicking step 1.
-        box_2d = OPTIONAL bounding box for the step's element in [y1, x1, y2, x2] form, each value in [0, 1000] normalized to the current screenshot. origin top-left, y first. include it whenever you can on step 1 — it's how this model is natively trained to localize. ALWAYS include it for apps without accessibility (Blender, games, canvas tools).
+        steps = exactly one item: [{type?, label, value?, hint, targetContext?, point_2d?, box_2d?}]. the step MUST be visible on the current screen unless it has targetContext:"currentHighlight", targetContext:"currentSelection", or targetContext:"focusedElement".
+        point_2d = OPTIONAL exact click/target point in [y, x] form, each value in [0, 1000] normalized to the current screenshot. origin top-left, y first. include this whenever you can, especially for Blender, games, canvas tools, tiny controls, toolbar icons, dense menus, and anything where the center of a box might be wrong.
+        box_2d = OPTIONAL bounding box for the step's element in [y1, x1, y2, x2] form, each value in [0, 1000] normalized to the current screenshot. origin top-left, y first. include it as supporting context when useful, but point_2d is preferred for the actual target location.
 
     STEP TYPES (for submit_workflow_plan):
     every step has an optional `type` field. omit it and it defaults to "click", which is what 95% of steps are. only emit a non-click type when the step is genuinely not a click on visible UI.
@@ -1611,7 +1722,7 @@ final class CompanionManager: ObservableObject {
 
       type: "type"
         value = the literal text to type into the currently focused field. label may name the target field, like "Note body".
-        ONLY use after a step has focused a text field (clicking it, or a Cmd+N that opens a fresh field). NEVER chain two `type` steps — concatenate the text into one step instead.
+        ONLY use when the text field/range is already focused, highlighted, or selected. because this is single-action mode, do NOT emit a separate click step before typing in the same tool call.
         do NOT translate the text. if the user said "type 'on my way'", the value is exactly `on my way`, not the user's spoken language.
         if the user said to rewrite/change/delete/replace the current highlighted area, include targetContext:"currentHighlight" and type ONLY the replacement text in value.
         for writing a title plus body, put the entire text in ONE type step's value with newline characters between title and paragraphs.
@@ -1633,12 +1744,13 @@ final class CompanionManager: ObservableObject {
 
     ABSOLUTE RULES:
     - exactly ONE tool call per turn. never the same tool twice.
+    - exactly ONE step inside submit_workflow_plan. never chain actions.
     - any computer control → submit_workflow_plan.
     - for "where is it" / pointing-only requests, do not call a tool; answer conversationally from the screenshot.
     - no UI involvement (pure knowledge or chit-chat) → no tool, just speak.
 
     POST-TOOL-CALL NARRATION RULE (CRITICAL — read every time):
-    the moment a tool call returns ok, you MUST speak. going silent after a tool fires is a bug — the user hears nothing happen. ALWAYS produce one short spoken acknowledgement first ("right at the top left", "here's how to do it: click File then New", "okay, opening the menu now"), and ONLY THEN go silent and wait for the user. silence comes AFTER the narration, not instead of it. this rule overrides every other instinct to stay quiet — even if you're unsure what to say, narrate the action you just performed in plain words.
+    the moment a tool call returns ok, you MUST speak. going silent after a tool fires is a bug — the user hears nothing happen. ALWAYS produce one short spoken acknowledgement first ("right at the top left", "opening the File menu", "okay, clicking object mode now"), and ONLY THEN go silent and wait for the user. silence comes AFTER the narration, not instead of it. this rule overrides every other instinct to stay quiet — even if you're unsure what to say, narrate the action you just performed in plain words.
 
     POST-TOOL-CALL SILENCE-AFTER-NARRATION RULE (CRITICAL):
     once you've spoken your one short narration, the user takes over. they read, they think, they act at human speed — this can take many seconds. during that time you stay COMPLETELY SILENT and call NO tool. do NOT re-point at the same element because "they didn't click yet." do NOT re-submit a plan because "they haven't moved." do NOT helpfully suggest the next step. just wait. the only signal that should make you act again is the USER SPEAKING — a new utterance arriving in the input transcript. screenshots showing an unchanged screen mean nothing; ignore them. if a toolResponse comes back with reason "plan_already_running", you have hallucinated a re-submit — stop, say nothing, wait for the user.
@@ -1648,9 +1760,9 @@ final class CompanionManager: ObservableObject {
 
     this rule ONLY applies when a tool call is coming. for pure knowledge / chit-chat with no tool, speak normally.
 
-    after submit_workflow_plan returns, narrate the full plan out loud in ONE natural-sounding turn. one to two short sentences total. describe the sequence the user will follow. do NOT pause between steps, do NOT wait for anything — speak the whole thing uninterrupted and then stop. the cursor and checklist handle per-step timing independently; your job is the voice-over, not the sync.
-      example: "click File, then New, then File..."
-      example: "open the Render menu and pick Render Animation."
+    after submit_workflow_plan returns, narrate only the single action you performed in one short sentence. do not describe future steps or a sequence.
+      example: "opening the add menu."
+      example: "clicking object mode."
 
     examples:
 
@@ -1660,27 +1772,20 @@ final class CompanionManager: ObservableObject {
 
     user: "how do I create a new file in Xcode"
       → submit_workflow_plan(goal: "create a new file", app: "Xcode",
-           steps: [{label:"File", hint:"Open the File menu"},
-                   {label:"New", hint:"Pick New"},
-                   {label:"File...", hint:"Choose File..."}])
-      → speak: "here's how to create a new file."
-      (then later, per-step NARRATE: messages arrive one at a time)
+           steps: [{label:"File", hint:"Open the File menu"}])
+      → speak: "opening File."
 
     user: "save this file as report.pdf"
       (Pages is foreground, document is unsaved)
       → submit_workflow_plan(goal: "save the file as report.pdf", app: "Pages",
-           steps: [{type:"keyboardShortcut", label:"Cmd+S", hint:"Open the save sheet"},
-                   {type:"type", label:"report.pdf", hint:"Type the filename"},
-                   {type:"keyboardShortcut", label:"Return", hint:"Confirm save"}])
-      → speak: "saving as report.pdf."
+           steps: [{type:"keyboardShortcut", label:"Cmd+S", hint:"Open the save sheet"}])
+      → speak: "opening the save sheet."
 
     user: "make a new folder on the desktop called Photos"
       (Finder is foreground, desktop visible)
       → submit_workflow_plan(goal: "create a Photos folder on the desktop", app: "Finder",
-           steps: [{type:"keyboardShortcut", label:"Cmd+Shift+N", hint:"New folder shortcut"},
-                   {type:"type", label:"Photos", hint:"Type the folder name"},
-                   {type:"keyboardShortcut", label:"Return", hint:"Confirm name"}])
-      → speak: "making a Photos folder."
+           steps: [{type:"keyboardShortcut", label:"Cmd+Shift+N", hint:"New folder shortcut"}])
+      → speak: "creating a new folder."
 
     user: "open Activity Monitor"
       → submit_workflow_plan(goal: "launch Activity Monitor", app: "Activity Monitor",
@@ -1695,10 +1800,8 @@ final class CompanionManager: ObservableObject {
     user: "send 'on my way' to mom in messages"
       (Messages is foreground, the user is in mom's thread)
       → submit_workflow_plan(goal: "send a message to mom", app: "Messages",
-           steps: [{label:"iMessage", hint:"Click the message field to focus it"},
-                   {type:"type", label:"on my way", hint:"Type the message"},
-                   {type:"keyboardShortcut", label:"Return", hint:"Send"}])
-      → speak: "sending 'on my way'."
+           steps: [{label:"iMessage", hint:"Click the message field to focus it"}])
+      → speak: "focusing the message field."
 
     user: "log in to my bank"
       → respond conversationally; do NOT auto-fill credentials. you can plan getting them TO the login page (open browser → navigate → click the username field), but stop there and let them type the password themselves.
@@ -1715,10 +1818,10 @@ final class CompanionManager: ObservableObject {
             : UserDefaults.standard.bool(forKey: "isMultiStepTourGuideEnabled")
 
         if isEnabled {
-            return "MULTI-STEP TOUR GUIDE MODE: enabled. you may use submit_workflow_plan for teaching-style walkthroughs when the user asks \"how do i\", \"show me\", \"walk me through\", or \"teach me\"."
+            return "MULTI-STEP TOUR GUIDE MODE: unavailable in single-action mode. even when teaching is enabled, submit_workflow_plan may contain exactly one step."
         }
 
-        return "MULTI-STEP TOUR GUIDE MODE: disabled. do not use submit_workflow_plan for teaching-style walkthroughs where the user is supposed to click step by step. use submit_workflow_plan only when TipTour should actually perform actions in Autopilot. if the user asks \"how do i\", \"show me\", \"walk me through\", or \"teach me\", answer conversationally or point at one visible element instead of creating a guided tour."
+        return "MULTI-STEP TOUR GUIDE MODE: disabled. do not create guided tours or chained action plans. use submit_workflow_plan only for the next single Autopilot action. if the user asks \"how do i\", \"show me\", \"walk me through\", or \"teach me\", answer conversationally or point at one visible element instead of creating a guided tour."
     }
 
     // MARK: - Image Conversion

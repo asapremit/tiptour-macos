@@ -167,11 +167,11 @@ final class GeminiLiveClient: @unchecked Sendable {
         // automatic voice activity detection, AND the tools Gemini can call.
         //
         // One action tool is declared. Gemini Live has vision +
-        // reasoning, so it produces the CUA action plan itself without
+        // reasoning, so it produces the CUA action step itself without
         // a second planner model or a separate point-at-element path.
         let submitWorkflowPlanTool: [String: Any] = [
             "name": "submit_workflow_plan",
-            "description": "Submit a CUA action plan for anything the user wants done on the computer: open apps, open URLs, click UI, press shortcuts, type text, edit highlighted/selected content, or scroll. Use this for both one-step and multi-step actions.",
+            "description": "Submit exactly one CUA action step for anything the user wants done on the computer: open an app, open a URL, click UI, press a shortcut, type text, edit highlighted/selected content, or scroll. Never submit a multi-step sequence; wait for the next screen/user turn before the next action.",
             "parameters": [
                 "type": "object",
                 "properties": [
@@ -185,7 +185,9 @@ final class GeminiLiveClient: @unchecked Sendable {
                     ],
                     "steps": [
                         "type": "array",
-                        "description": "Ordered list of steps. First step MUST be visible on the current screen; later steps describe the path to take after clicking step 1.",
+                        "description": "Exactly one step. The step MUST be visible on the current screen unless it uses currentHighlight/currentSelection/focusedElement context.",
+                        "minItems": 1,
+                        "maxItems": 1,
                         "items": [
                             "type": "object",
                             "properties": [
@@ -245,9 +247,16 @@ final class GeminiLiveClient: @unchecked Sendable {
                                         "focusedElement"
                                     ]
                                 ],
+                                "point_2d": [
+                                    "type": "array",
+                                    "description": "Optional exact click/target point in normalized [y, x] form, each value in [0, 1000] relative to the current screenshot. Origin is top-left, y comes first. Prefer this for dense UI, tiny controls, Blender, games, canvas tools, and toolbar/menu targets.",
+                                    "items": ["type": "integer"],
+                                    "minItems": 2,
+                                    "maxItems": 2
+                                ],
                                 "box_2d": [
                                     "type": "array",
-                                    "description": "Optional bounding box for the element in normalized [y1, x1, y2, x2] form, each value in [0, 1000] relative to the current screenshot. Origin is top-left, y comes first. Recommended for step 1 in apps without accessibility (Blender, games, canvas tools) and for ambiguous labels.",
+                                    "description": "Optional bounding box for the element in normalized [y1, x1, y2, x2] form, each value in [0, 1000] relative to the current screenshot. Origin is top-left, y comes first. Useful as supporting context when labels are ambiguous; point_2d is preferred for the actual click target.",
                                     "items": ["type": "integer"],
                                     "minItems": 4,
                                     "maxItems": 4

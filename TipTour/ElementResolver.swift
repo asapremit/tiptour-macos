@@ -9,7 +9,8 @@
 //       supports AX — almost all native Mac apps, most Cocoa third-party
 //       apps, and Electron apps that respect AXManualAccessibility).
 //    2. Browser DOM coordinates through CUA/CDP for Chromium web pages.
-//    3. Raw Gemini-emitted box_2d coordinates as the absolute fallback.
+//    3. Native detector cache refinement for apps with weak AX trees.
+//    4. Raw Gemini-emitted box_2d coordinates as the absolute fallback.
 //       These come from the same model that named the element, so they
 //       reflect Gemini's spatial intent for that exact tool call.
 //
@@ -34,6 +35,7 @@ final class ElementResolver: @unchecked Sendable {
     enum ResolutionSource {
         case accessibilityTree       // AX tree gave us exact frame
         case browserDOMCoordinates   // Browser DOM rect through CUA/CDP
+        case nativeDetectorCache     // Local CoreML/Vision detector refined the model hint
         case llmRawCoordinates       // Straight from Gemini's box_2d, no refinement
     }
 
@@ -128,7 +130,7 @@ final class ElementResolver: @unchecked Sendable {
         return nil
     }
 
-    /// Full resolution pipeline: AX → browser DOM/CDP → box_2d, tried in order
+    /// Full resolution pipeline: AX → browser DOM/CDP → native detector → box_2d, tried in order
     /// with early exit.
     ///
     /// Tier order is deliberate:
@@ -136,7 +138,10 @@ final class ElementResolver: @unchecked Sendable {
     ///      it's the only path that gives us a real element rect for
     ///      the click detector to use as a tight hit region.
     ///   2. Browser DOM/CDP coordinates for Chromium pages.
-    ///   3. Gemini's box_2d as final fallback. Those coordinates are
+    ///   3. Native detector cache for canvas/no-AX apps like Blender.
+    ///      The model's box_2d becomes a proximity hint, then local
+    ///      CoreML/OCR detections snap it to a real nearby UI box.
+    ///   4. Gemini's box_2d as final fallback. Those coordinates are
     ///      the same model's spatial output for the same query — they
     ///      reflect everything Gemini knew at tool-call time.
     ///
@@ -162,6 +167,11 @@ final class ElementResolver: @unchecked Sendable {
             }
         }
 
+        let shouldSkipAXAndBrowser = shouldSkipAXAndBrowserForVisionOnlyApp(targetAppHint: targetAppHint)
+        if shouldSkipAXAndBrowser {
+            print("[ElementResolver] ⏭ vision-only app \"\(targetAppHint ?? "?")\" — skipping AX/CDP for \"\(label)\"")
+        }
+
         // 1. AX tree first — fastest and most reliable for native apps.
         //    Target app hint lets us bypass the system's "frontmost" when
         //    that's a background recorder (Cap) instead of the app the
@@ -172,7 +182,8 @@ final class ElementResolver: @unchecked Sendable {
         //    of wasted IPC on every subsequent pointing call and — more
         //    importantly — the CPU that walk would burn while Gemini's
         //    audio is streaming.
-        if !AccessibilityTreeResolver.isAppKnownToLackAXTree(hint: targetAppHint) {
+        if !shouldSkipAXAndBrowser,
+           !AccessibilityTreeResolver.isAppKnownToLackAXTree(hint: targetAppHint) {
             if let axResolution = await tryAccessibilityTree(label: label, targetAppHint: targetAppHint) {
                 return axResolution
             }
@@ -202,22 +213,24 @@ final class ElementResolver: @unchecked Sendable {
         //    pages can expose better geometry through the page itself
         //    than through the macOS AX tree, especially for template
         //    cards and heavily styled web controls.
-        if let browserResolution = await browserCoordinateResolver.resolve(
-            label: label,
-            targetAppHint: targetAppHint
-        ) {
-            let displayFrame = await MainActor.run {
-                displayFrameContaining(browserResolution.globalScreenPoint)
-                    ?? NSScreen.main?.frame
-                    ?? .zero
+        if !shouldSkipAXAndBrowser {
+            if let browserResolution = await browserCoordinateResolver.resolve(
+                label: label,
+                targetAppHint: targetAppHint
+            ) {
+                let displayFrame = await MainActor.run {
+                    displayFrameContaining(browserResolution.globalScreenPoint)
+                        ?? NSScreen.main?.frame
+                        ?? .zero
+                }
+                return Resolution(
+                    globalScreenPoint: browserResolution.globalScreenPoint,
+                    displayFrame: displayFrame,
+                    label: browserResolution.matchedLabel,
+                    source: .browserDOMCoordinates,
+                    globalScreenRect: browserResolution.globalScreenRect
+                )
             }
-            return Resolution(
-                globalScreenPoint: browserResolution.globalScreenPoint,
-                displayFrame: displayFrame,
-                label: browserResolution.matchedLabel,
-                source: .browserDOMCoordinates,
-                globalScreenRect: browserResolution.globalScreenRect
-            )
         }
 
         guard let capture = latestCapture else {
@@ -225,7 +238,19 @@ final class ElementResolver: @unchecked Sendable {
             return nil
         }
 
-        // 3. Trust the model's box_2d when it gave us one. This is
+        // 3. If the native detector overlay/cache is warm, use it to
+        //    refine the model's rough point before falling back raw.
+        //    This matters for apps like Blender where AX exposes almost
+        //    nothing, but the local detector can still see tabs/buttons.
+        if let nativeDetectorResolution = await nativeDetectorResolution(
+            label: label,
+            llmHintInScreenshotPixels: llmHintInScreenshotPixels,
+            capture: capture
+        ) {
+            return nativeDetectorResolution
+        }
+
+        // 4. Trust the model's box_2d when it gave us one. This is
         //    Gemini's spatial output for the same query that emitted
         //    the label — one model, one decision.
         if let hint = llmHintInScreenshotPixels {
@@ -238,6 +263,57 @@ final class ElementResolver: @unchecked Sendable {
 
         print("[ElementResolver] ✗ could not resolve \"\(label)\" — AX missed and no box_2d hint")
         return nil
+    }
+
+    private func nativeDetectorResolution(
+        label: String,
+        llmHintInScreenshotPixels: CGPoint?,
+        capture: CompanionScreenCapture
+    ) async -> Resolution? {
+        var nativeDetectorMatch = nativeDetectorCachedMatch(
+            label: label,
+            llmHintInScreenshotPixels: llmHintInScreenshotPixels
+        )
+
+        if nativeDetectorMatch == nil,
+           let screenshotImage = NSBitmapImageRep(data: capture.imageData)?.cgImage {
+            _ = await NativeElementDetector.shared.detectElements(in: screenshotImage)
+            nativeDetectorMatch = nativeDetectorCachedMatch(
+                label: label,
+                llmHintInScreenshotPixels: llmHintInScreenshotPixels
+            )
+        }
+
+        guard let nativeDetectorMatch else { return nil }
+
+        let globalPoint = screenshotPixelToGlobalScreen(nativeDetectorMatch.center, capture: capture)
+        let globalRect = screenshotPixelRectToGlobalScreen(nativeDetectorMatch.bbox, capture: capture)
+        print("[ElementResolver] ✓ native detector refined \"\(label)\" → \"\(nativeDetectorMatch.label)\" at screenshotPixel=\(nativeDetectorMatch.center), screen=\(globalPoint), cacheAge=\(nativeDetectorMatch.cacheAgeMs)ms")
+
+        return Resolution(
+            globalScreenPoint: globalPoint,
+            displayFrame: capture.displayFrame,
+            label: label,
+            source: .nativeDetectorCache,
+            globalScreenRect: globalRect
+        )
+    }
+
+    private func nativeDetectorCachedMatch(
+        label: String,
+        llmHintInScreenshotPixels: CGPoint?
+    ) -> NativeElementDetector.FoundElement? {
+        if let hint = llmHintInScreenshotPixels {
+            return NativeElementDetector.shared.refineCoordinate(hint: hint, label: label)
+                ?? NativeElementDetector.shared.findFromCache(query: label, preferMatchesNearPixel: hint)
+        }
+        return NativeElementDetector.shared.findFromCache(query: label)
+    }
+
+    private func shouldSkipAXAndBrowserForVisionOnlyApp(targetAppHint: String?) -> Bool {
+        guard let normalizedTargetAppHint = targetAppHint?.lowercased() else { return false }
+        return normalizedTargetAppHint.contains("blender")
+            || normalizedTargetAppHint.contains("org.blenderfoundation.blender")
     }
 
     // MARK: - Multilingual Fallback
@@ -360,6 +436,24 @@ final class ElementResolver: @unchecked Sendable {
         return CGPoint(
             x: displayLocalX + displayFrame.origin.x,
             y: appKitY + displayFrame.origin.y
+        )
+    }
+
+    private func screenshotPixelRectToGlobalScreen(_ pixelRect: CGRect, capture: CompanionScreenCapture) -> CGRect {
+        let topLeft = screenshotPixelToGlobalScreen(
+            CGPoint(x: pixelRect.minX, y: pixelRect.minY),
+            capture: capture
+        )
+        let bottomRight = screenshotPixelToGlobalScreen(
+            CGPoint(x: pixelRect.maxX, y: pixelRect.maxY),
+            capture: capture
+        )
+
+        return CGRect(
+            x: min(topLeft.x, bottomRight.x),
+            y: min(topLeft.y, bottomRight.y),
+            width: abs(bottomRight.x - topLeft.x),
+            height: abs(topLeft.y - bottomRight.y)
         )
     }
 

@@ -85,14 +85,19 @@ enum CompanionScreenCaptureUtility {
             let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows)
 
             let configuration = SCStreamConfiguration()
-            let maxDimension = 1280
-            let aspectRatio = CGFloat(display.width) / CGFloat(display.height)
-            if display.width >= display.height {
-                configuration.width = maxDimension
-                configuration.height = Int(CGFloat(maxDimension) / aspectRatio)
+            if isCursorScreen {
+                configuration.width = display.width
+                configuration.height = display.height
             } else {
-                configuration.height = maxDimension
-                configuration.width = Int(CGFloat(maxDimension) * aspectRatio)
+                let maxSecondaryScreenDimension = 1280
+                let aspectRatio = CGFloat(display.width) / CGFloat(display.height)
+                if display.width >= display.height {
+                    configuration.width = maxSecondaryScreenDimension
+                    configuration.height = Int(CGFloat(maxSecondaryScreenDimension) / aspectRatio)
+                } else {
+                    configuration.height = maxSecondaryScreenDimension
+                    configuration.width = Int(CGFloat(maxSecondaryScreenDimension) * aspectRatio)
+                }
             }
 
             let cgImage = try await SCScreenshotManager.captureImage(
@@ -100,8 +105,9 @@ enum CompanionScreenCaptureUtility {
                 configuration: configuration
             )
 
+            let jpegCompressionQuality = isCursorScreen ? 0.9 : 0.8
             guard let jpegData = NSBitmapImageRep(cgImage: cgImage)
-                    .representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
+                    .representation(using: .jpeg, properties: [.compressionFactor: jpegCompressionQuality]) else {
                 continue
             }
 
@@ -121,8 +127,8 @@ enum CompanionScreenCaptureUtility {
                 displayWidthInPoints: Int(displayFrame.width),
                 displayHeightInPoints: Int(displayFrame.height),
                 displayFrame: displayFrame,
-                screenshotWidthInPixels: configuration.width,
-                screenshotHeightInPixels: configuration.height,
+                screenshotWidthInPixels: cgImage.width,
+                screenshotHeightInPixels: cgImage.height,
                 captureTimestamp: Date()
             ))
         }
@@ -169,15 +175,8 @@ enum CompanionScreenCaptureUtility {
         let filter = SCContentFilter(display: cursorDisplay, excludingWindows: ownAppWindows)
 
         let configuration = SCStreamConfiguration()
-        let maxDimension = 1280
-        let aspectRatio = CGFloat(cursorDisplay.width) / CGFloat(cursorDisplay.height)
-        if cursorDisplay.width >= cursorDisplay.height {
-            configuration.width = maxDimension
-            configuration.height = Int(CGFloat(maxDimension) / aspectRatio)
-        } else {
-            configuration.height = maxDimension
-            configuration.width = Int(CGFloat(maxDimension) * aspectRatio)
-        }
+        configuration.width = cursorDisplay.width
+        configuration.height = cursorDisplay.height
 
         return try await SCScreenshotManager.captureImage(
             contentFilter: filter,
