@@ -61,6 +61,9 @@ struct CompanionPanelView: View {
                 screenshotStreamingToggleRow
                     .padding(.horizontal, 16)
                 Spacer().frame(height: 6)
+                accurateGroundingToggleRow
+                    .padding(.horizontal, 16)
+                Spacer().frame(height: 6)
                 nekoModeToggleRow
                     .padding(.horizontal, 16)
             }
@@ -548,6 +551,48 @@ struct CompanionPanelView: View {
 
     // MARK: - Neko Mode Toggle
 
+    private var accurateGroundingToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: companionManager.isAccurateGroundingEnabled
+                      ? "scope"
+                      : "scope")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(
+                        companionManager.isAccurateGroundingEnabled
+                            ? DS.Colors.accent
+                            : DS.Colors.textTertiary
+                    )
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Accurate Grounding")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text(
+                        companionManager.isAccurateGroundingEnabled
+                            ? "local YOLO + OCR targets"
+                            : "standard AX/CDP grounding"
+                    )
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                }
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isAccurateGroundingEnabled },
+                set: { companionManager.setAccurateGroundingEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
     /// Whimsical toggle that swaps the blue triangle cursor for a
     /// pixel-art cat (classic oneko sprites).
     private var nekoModeToggleRow: some View {
@@ -1021,7 +1066,7 @@ struct CompanionPanelView: View {
                 NotificationCenter.default.post(name: .tipTourDismissPanel, object: nil)
             }
 
-            devToolRow("Detection + OCR Overlay", systemImage: "viewfinder") {
+            devToolRow("Show Detection Overlay", systemImage: "viewfinder") {
                 companionManager.setDetectionOverlayEnabled(!companionManager.isDetectionOverlayEnabled)
                 NotificationCenter.default.post(name: .tipTourDismissPanel, object: nil)
             } trailing: {

@@ -45,6 +45,9 @@ final class CompanionManager: ObservableObject {
 
     /// Debug-only visual overlay for the restored native CoreML/Vision
     /// detector. This is deliberately not sent to Gemini yet.
+    @Published var isAccurateGroundingEnabled: Bool = UserDefaults.standard.object(forKey: "isAccurateGroundingEnabled") == nil
+        ? false
+        : UserDefaults.standard.bool(forKey: "isAccurateGroundingEnabled")
     @Published var isDetectionOverlayEnabled: Bool = false
     @Published var detectionOverlayElements: [[String: Any]] = []
     @Published var detectionOverlayImageSize: [Int] = [1512, 982]
@@ -94,6 +97,10 @@ final class CompanionManager: ObservableObject {
         let topmostWindowID: Int?
         let topmostWindowProcessIdentifier: Int32?
         let topmostWindowBounds: WindowBounds?
+    }
+
+    private var shouldRunNativeDetection: Bool {
+        isAccurateGroundingEnabled || isDetectionOverlayEnabled
     }
 
     /// True when all four required permissions (accessibility, screen recording,
@@ -778,7 +785,7 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
-        stopNativeDetectionOverlay()
+        stopNativeDetection()
         globalPushToTalkShortcutMonitor.stop()
         globalHighlightShortcutMonitor.stop()
         overlayWindowManager.hideOverlay()
@@ -796,32 +803,49 @@ final class CompanionManager: ObservableObject {
         detectedElementBubbleText = nil
     }
 
-    // MARK: - Native Detection Overlay
+    // MARK: - Native Accurate Grounding + Detection Overlay
 
     func setDetectionOverlayEnabled(_ enabled: Bool) {
         isDetectionOverlayEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isDetectionOverlayEnabled")
 
         if enabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
-            startNativeDetectionOverlay()
+            startNativeDetection()
         } else {
-            stopNativeDetectionOverlay()
+            detectionOverlayElements = []
+            detectionOverlayDisplayFrame = nil
+            detectionOverlayHighlightedLabel = nil
+            if !shouldRunNativeDetection {
+                stopNativeDetection()
+            }
         }
     }
 
-    private func startNativeDetectionOverlay() {
+    func setAccurateGroundingEnabled(_ enabled: Bool) {
+        isAccurateGroundingEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isAccurateGroundingEnabled")
+
+        if enabled {
+            startNativeDetection()
+        } else if !shouldRunNativeDetection {
+            stopNativeDetection()
+        }
+    }
+
+    private func startNativeDetection() {
         detectionOverlayTask?.cancel()
         detectionOverlayScreenMonitorTask?.cancel()
         lastDetectionOverlaySceneSignature = currentDetectionOverlaySceneSignature()
 
-        installNativeDetectionOverlayObservers()
+        installNativeDetectionObservers()
         scheduleNativeDetectionOverlayRefresh(reason: "enabled")
         startNativeDetectionOverlayScreenMonitor()
     }
 
-    private func installNativeDetectionOverlayObservers() {
+    private func installNativeDetectionObservers() {
         if detectionOverlayAppActivationObserver == nil {
             detectionOverlayAppActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didActivateApplicationNotification,
@@ -868,7 +892,7 @@ final class CompanionManager: ObservableObject {
 
             while !Task.isCancelled {
                 await MainActor.run {
-                    guard self.isDetectionOverlayEnabled else { return }
+                    guard self.shouldRunNativeDetection else { return }
                     let currentSignature = self.currentDetectionOverlaySceneSignature()
                     if self.lastDetectionOverlaySceneSignature != currentSignature {
                         self.lastDetectionOverlaySceneSignature = currentSignature
@@ -885,7 +909,7 @@ final class CompanionManager: ObservableObject {
         reason: String,
         debounceNanoseconds: UInt64 = 150_000_000
     ) {
-        guard isDetectionOverlayEnabled else { return }
+        guard shouldRunNativeDetection else { return }
 
         detectionOverlayTask?.cancel()
         detectionOverlayTask = Task { [weak self] in
@@ -921,10 +945,12 @@ final class CompanionManager: ObservableObject {
                 ] as [String: Any]
             }
 
-            guard isDetectionOverlayEnabled else { return }
-            detectionOverlayElements = overlayElements
+            guard shouldRunNativeDetection else { return }
             detectionOverlayImageSize = [capturedImage.width, capturedImage.height]
-            detectionOverlayDisplayFrame = cursorScreen?.frame
+            if isDetectionOverlayEnabled {
+                detectionOverlayElements = overlayElements
+                detectionOverlayDisplayFrame = cursorScreen?.frame
+            }
             if let displayFrame = cursorScreen?.frame {
                 LocalPerceptionTargetCache.shared.update(
                     elements: overlayElements,
@@ -939,7 +965,7 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    private func stopNativeDetectionOverlay() {
+    private func stopNativeDetection() {
         detectionOverlayTask?.cancel()
         detectionOverlayTask = nil
         detectionOverlayScreenMonitorTask?.cancel()
@@ -956,7 +982,6 @@ final class CompanionManager: ObservableObject {
             NotificationCenter.default.removeObserver(detectionOverlayClickObserver)
             self.detectionOverlayClickObserver = nil
         }
-        isDetectionOverlayEnabled = false
         detectionOverlayElements = []
         detectionOverlayDisplayFrame = nil
         detectionOverlayHighlightedLabel = nil
@@ -2176,7 +2201,7 @@ final class CompanionManager: ObservableObject {
     /// path: by the time the first CUA plan arrives,
     /// resolution returns in ~10-30ms instead of 100-400ms.
     func startVoiceSession() {
-        if isDetectionOverlayEnabled {
+        if shouldRunNativeDetection {
             scheduleNativeDetectionOverlayRefresh(reason: "voice session started", debounceNanoseconds: 0)
         }
 

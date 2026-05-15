@@ -321,9 +321,9 @@ struct BlueCursorView: View {
                 committedContext: nil
             )
 
-            if companionManager.isDetectionOverlayEnabled,
-               companionManager.detectionOverlayDisplayFrame == nil
-                || companionManager.detectionOverlayDisplayFrame == screenFrame {
+            if companionManager.isDetectionOverlayEnabled
+                && (companionManager.detectionOverlayDisplayFrame == nil
+                    || companionManager.detectionOverlayDisplayFrame == screenFrame) {
                 DetectionOverlayView(
                     elements: companionManager.detectionOverlayElements,
                     highlightedLabel: companionManager.detectionOverlayHighlightedLabel,
