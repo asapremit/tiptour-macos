@@ -83,6 +83,18 @@ final class CompanionManager: ObservableObject {
     private var voiceAudioPowerCancellable: AnyCancellable?
     private var voiceModelSpeakingCancellable: AnyCancellable?
     private var detectionOverlayTask: Task<Void, Never>?
+    private var detectionOverlayScreenMonitorTask: Task<Void, Never>?
+    private var detectionOverlayAppActivationObserver: NSObjectProtocol?
+    private var detectionOverlayScreenParametersObserver: NSObjectProtocol?
+    private var detectionOverlayClickObserver: NSObjectProtocol?
+    private var lastDetectionOverlaySceneSignature: DetectionOverlaySceneSignature?
+
+    private struct DetectionOverlaySceneSignature: Equatable {
+        let screenFrame: CGRect?
+        let topmostWindowID: Int?
+        let topmostWindowProcessIdentifier: Int32?
+        let topmostWindowBounds: WindowBounds?
+    }
 
     /// True when all four required permissions (accessibility, screen recording,
     /// microphone, screen content) are granted. Used by the panel to show a single "all good" state.
@@ -102,6 +114,7 @@ final class CompanionManager: ObservableObject {
             apiKeyURL: Self.workerBaseURL.map { "\($0)/gemini-live-key" },
             systemPrompt: Self.companionVoiceResponseSystemPrompt
         )
+        backend.setScreenshotStreamingEnabled(isScreenshotStreamingEnabled)
         wireCallbacks(on: backend)
         _voiceBackend = backend
         rebindVoiceBackendPublishers(backend)
@@ -176,7 +189,21 @@ final class CompanionManager: ObservableObject {
         box2DNormalized: [Int]?,
         capture: CompanionScreenCapture?
     ) -> CGPoint? {
-        guard let box = box2DNormalized, box.count == 4, let capture else {
+        guard let capture else { return nil }
+        return pixelHintFromBox2D(
+            box2DNormalized: box2DNormalized,
+            imageSize: CGSize(
+                width: capture.screenshotWidthInPixels,
+                height: capture.screenshotHeightInPixels
+            )
+        )
+    }
+
+    private func pixelHintFromBox2D(
+        box2DNormalized: [Int]?,
+        imageSize: CGSize
+    ) -> CGPoint? {
+        guard let box = box2DNormalized, box.count == 4 else {
             return nil
         }
         let y1Norm = CGFloat(box[0])
@@ -187,11 +214,8 @@ final class CompanionManager: ObservableObject {
         let centerNormX = (x1Norm + x2Norm) / 2
         let centerNormY = (y1Norm + y2Norm) / 2
 
-        let screenshotWidth = CGFloat(capture.screenshotWidthInPixels)
-        let screenshotHeight = CGFloat(capture.screenshotHeightInPixels)
-
-        let pixelX = centerNormX * screenshotWidth / 1000
-        let pixelY = centerNormY * screenshotHeight / 1000
+        let pixelX = centerNormX * imageSize.width / 1000
+        let pixelY = centerNormY * imageSize.height / 1000
         return CGPoint(x: pixelX, y: pixelY)
     }
 
@@ -203,17 +227,29 @@ final class CompanionManager: ObservableObject {
         point2DNormalized: [Int]?,
         capture: CompanionScreenCapture?
     ) -> CGPoint? {
-        guard let point = point2DNormalized, point.count == 2, let capture else {
+        guard let capture else { return nil }
+        return pixelHintFromPoint2D(
+            point2DNormalized: point2DNormalized,
+            imageSize: CGSize(
+                width: capture.screenshotWidthInPixels,
+                height: capture.screenshotHeightInPixels
+            )
+        )
+    }
+
+    private func pixelHintFromPoint2D(
+        point2DNormalized: [Int]?,
+        imageSize: CGSize
+    ) -> CGPoint? {
+        guard let point = point2DNormalized, point.count == 2 else {
             return nil
         }
 
         let yNorm = CGFloat(point[0])
         let xNorm = CGFloat(point[1])
-        let screenshotWidth = CGFloat(capture.screenshotWidthInPixels)
-        let screenshotHeight = CGFloat(capture.screenshotHeightInPixels)
 
-        let pixelX = xNorm * screenshotWidth / 1000
-        let pixelY = yNorm * screenshotHeight / 1000
+        let pixelX = xNorm * imageSize.width / 1000
+        let pixelY = yNorm * imageSize.height / 1000
         return CGPoint(x: pixelX, y: pixelY)
     }
 
@@ -399,6 +435,12 @@ final class CompanionManager: ObservableObject {
             ) ?? pixelHintFromBox2D(
                 box2DNormalized: box2DNormalized,
                 capture: captureForBoxConversion
+            ) ?? pixelHintFromPoint2D(
+                point2DNormalized: point2DNormalized,
+                imageSize: CGSize(width: detectionOverlayImageSize[0], height: detectionOverlayImageSize[1])
+            ) ?? pixelHintFromBox2D(
+                box2DNormalized: box2DNormalized,
+                imageSize: CGSize(width: detectionOverlayImageSize[0], height: detectionOverlayImageSize[1])
             )
             let hintX = pixelCenter.map { Int($0.x) }
             let hintY = pixelCenter.map { Int($0.y) }
@@ -592,6 +634,19 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "isAutopilotEnabled")
     }
 
+    /// Privacy mode for Gemini Live visual context. When enabled, TipTour
+    /// sends screen JPEGs to Gemini. When disabled, Gemini still hears the
+    /// user and can call tools, but it does not receive screenshots.
+    @Published var isScreenshotStreamingEnabled: Bool = UserDefaults.standard.object(forKey: "isScreenshotStreamingEnabled") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "isScreenshotStreamingEnabled")
+
+    func setScreenshotStreamingEnabled(_ enabled: Bool) {
+        isScreenshotStreamingEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isScreenshotStreamingEnabled")
+        _voiceBackend?.setScreenshotStreamingEnabled(enabled)
+    }
+
     /// Feature flag for the older teaching/tour-guide experience:
     /// visible checklist, step-by-step user-click guidance, and plan
     /// narration mode. Defaults OFF while action-taking is the primary
@@ -758,54 +813,178 @@ final class CompanionManager: ObservableObject {
 
     private func startNativeDetectionOverlay() {
         detectionOverlayTask?.cancel()
-        detectionOverlayTask = Task { [weak self] in
+        detectionOverlayScreenMonitorTask?.cancel()
+        lastDetectionOverlaySceneSignature = currentDetectionOverlaySceneSignature()
+
+        installNativeDetectionOverlayObservers()
+        scheduleNativeDetectionOverlayRefresh(reason: "enabled")
+        startNativeDetectionOverlayScreenMonitor()
+    }
+
+    private func installNativeDetectionOverlayObservers() {
+        if detectionOverlayAppActivationObserver == nil {
+            detectionOverlayAppActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let self else { return }
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+                    return
+                }
+                guard app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+                self.scheduleNativeDetectionOverlayRefresh(reason: "app changed")
+            }
+        }
+
+        if detectionOverlayScreenParametersObserver == nil {
+            detectionOverlayScreenParametersObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.scheduleNativeDetectionOverlayRefresh(reason: "screen parameters changed")
+            }
+        }
+
+        if detectionOverlayClickObserver == nil {
+            detectionOverlayClickObserver = NotificationCenter.default.addObserver(
+                forName: .tipTourUserInterfaceClickExecuted,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.scheduleNativeDetectionOverlayRefresh(
+                    reason: "click changed UI",
+                    debounceNanoseconds: 240_000_000
+                )
+            }
+        }
+    }
+
+    private func startNativeDetectionOverlayScreenMonitor() {
+        detectionOverlayScreenMonitorTask = Task { [weak self] in
             guard let self else { return }
-            let detectionOverlayRefreshIntervalNanoseconds: UInt64 = 800_000_000
+            let screenCheckIntervalNanoseconds: UInt64 = 300_000_000
 
             while !Task.isCancelled {
-                do {
-                    let mouseLocation = NSEvent.mouseLocation
-                    let cursorScreen = NSScreen.screens.first { $0.frame.contains(mouseLocation) } ?? NSScreen.main
-                    let capturedImage = try await CompanionScreenCaptureUtility.capturePrimaryScreenAsCGImage()
-                    let detectedElements = await NativeElementDetector.shared.detectElements(in: capturedImage)
-                    let overlayElements = detectedElements.map { detectedElement in
-                        [
-                            "bbox": [
-                                Int(detectedElement.bbox.minX),
-                                Int(detectedElement.bbox.minY),
-                                Int(detectedElement.bbox.maxX),
-                                Int(detectedElement.bbox.maxY)
-                            ],
-                            "center": [
-                                Int(detectedElement.center.x),
-                                Int(detectedElement.center.y)
-                            ],
-                            "conf": detectedElement.confidence,
-                            "label": detectedElement.label,
-                            "source": detectedElement.source
-                        ] as [String: Any]
+                await MainActor.run {
+                    guard self.isDetectionOverlayEnabled else { return }
+                    let currentSignature = self.currentDetectionOverlaySceneSignature()
+                    if self.lastDetectionOverlaySceneSignature != currentSignature {
+                        self.lastDetectionOverlaySceneSignature = currentSignature
+                        self.scheduleNativeDetectionOverlayRefresh(reason: "CUA visible window scene changed")
                     }
-
-                    guard !Task.isCancelled else { return }
-                    detectionOverlayElements = overlayElements
-                    detectionOverlayImageSize = [capturedImage.width, capturedImage.height]
-                    detectionOverlayDisplayFrame = cursorScreen?.frame
-                } catch {
-                    print("[NativeDetector] overlay capture failed: \(error.localizedDescription)")
                 }
 
-                try? await Task.sleep(nanoseconds: detectionOverlayRefreshIntervalNanoseconds)
+                try? await Task.sleep(nanoseconds: screenCheckIntervalNanoseconds)
             }
+        }
+    }
+
+    private func scheduleNativeDetectionOverlayRefresh(
+        reason: String,
+        debounceNanoseconds: UInt64 = 150_000_000
+    ) {
+        guard isDetectionOverlayEnabled else { return }
+
+        detectionOverlayTask?.cancel()
+        detectionOverlayTask = Task { [weak self] in
+            if debounceNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: debounceNanoseconds)
+            }
+            guard !Task.isCancelled else { return }
+            await self?.refreshNativeDetectionOverlay(reason: reason)
+        }
+    }
+
+    private func refreshNativeDetectionOverlay(reason: String) async {
+        do {
+            let mouseLocation = NSEvent.mouseLocation
+            let cursorScreen = NSScreen.screens.first { $0.frame.contains(mouseLocation) } ?? NSScreen.main
+            let capturedImage = try await CompanionScreenCaptureUtility.capturePrimaryScreenAsCGImage()
+            let detectedElements = await NativeElementDetector.shared.detectElements(in: capturedImage)
+            let overlayElements = detectedElements.map { detectedElement in
+                [
+                    "bbox": [
+                        Int(detectedElement.bbox.minX),
+                        Int(detectedElement.bbox.minY),
+                        Int(detectedElement.bbox.maxX),
+                        Int(detectedElement.bbox.maxY)
+                    ],
+                    "center": [
+                        Int(detectedElement.center.x),
+                        Int(detectedElement.center.y)
+                    ],
+                    "conf": detectedElement.confidence,
+                    "label": detectedElement.label,
+                    "source": detectedElement.source
+                ] as [String: Any]
+            }
+
+            guard isDetectionOverlayEnabled else { return }
+            detectionOverlayElements = overlayElements
+            detectionOverlayImageSize = [capturedImage.width, capturedImage.height]
+            detectionOverlayDisplayFrame = cursorScreen?.frame
+            if let displayFrame = cursorScreen?.frame {
+                LocalPerceptionTargetCache.shared.update(
+                    elements: overlayElements,
+                    imageSize: CGSize(width: capturedImage.width, height: capturedImage.height),
+                    displayFrame: displayFrame
+                )
+            }
+            lastDetectionOverlaySceneSignature = currentDetectionOverlaySceneSignature()
+            print("[NativeDetector] overlay refreshed — \(reason)")
+        } catch {
+            print("[NativeDetector] overlay capture failed: \(error.localizedDescription)")
         }
     }
 
     private func stopNativeDetectionOverlay() {
         detectionOverlayTask?.cancel()
         detectionOverlayTask = nil
+        detectionOverlayScreenMonitorTask?.cancel()
+        detectionOverlayScreenMonitorTask = nil
+        if let detectionOverlayAppActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(detectionOverlayAppActivationObserver)
+            self.detectionOverlayAppActivationObserver = nil
+        }
+        if let detectionOverlayScreenParametersObserver {
+            NotificationCenter.default.removeObserver(detectionOverlayScreenParametersObserver)
+            self.detectionOverlayScreenParametersObserver = nil
+        }
+        if let detectionOverlayClickObserver {
+            NotificationCenter.default.removeObserver(detectionOverlayClickObserver)
+            self.detectionOverlayClickObserver = nil
+        }
         isDetectionOverlayEnabled = false
         detectionOverlayElements = []
         detectionOverlayDisplayFrame = nil
         detectionOverlayHighlightedLabel = nil
+        LocalPerceptionTargetCache.shared.clear()
+        lastDetectionOverlaySceneSignature = nil
+    }
+
+    private func currentDetectionOverlaySceneSignature() -> DetectionOverlaySceneSignature {
+        let mouseLocation = NSEvent.mouseLocation
+        let cursorScreen = NSScreen.screens.first { $0.frame.contains(mouseLocation) } ?? NSScreen.main
+
+        return DetectionOverlaySceneSignature(
+            screenFrame: cursorScreen?.frame,
+            topmostWindowID: nil,
+            topmostWindowProcessIdentifier: nil,
+            topmostWindowBounds: nil
+        )
+    }
+
+    private static func topmostVisibleWindow(at globalAppKitPoint: CGPoint) -> WindowInfo? {
+        let ownProcessIdentifier = NSRunningApplication.current.processIdentifier
+        return WindowEnumerator.visibleWindows()
+            .filter { $0.layer == 0 }
+            .filter { $0.pid > 0 && $0.pid != ownProcessIdentifier }
+            .filter { windowInfo in
+                appKitFrame(from: windowInfo.bounds).contains(globalAppKitPoint)
+            }
+            .max(by: { $0.zIndex < $1.zIndex })
     }
 
     // MARK: - Permissions
@@ -1997,6 +2176,10 @@ final class CompanionManager: ObservableObject {
     /// path: by the time the first CUA plan arrives,
     /// resolution returns in ~10-30ms instead of 100-400ms.
     func startVoiceSession() {
+        if isDetectionOverlayEnabled {
+            scheduleNativeDetectionOverlayRefresh(reason: "voice session started", debounceNanoseconds: 0)
+        }
+
         Task.detached(priority: .userInitiated) {
             await Self.prefetchAccessibilityTreeForTargetApp()
         }

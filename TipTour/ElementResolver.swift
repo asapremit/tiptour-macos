@@ -4,13 +4,15 @@
 //
 //  Single entry point for "where on screen should the cursor fly to?"
 //
-//  Tries three lookup strategies in order of reliability:
+//  Tries lookup strategies in order of reliability:
 //    1. macOS Accessibility tree (~30ms, pixel-perfect when the app
 //       supports AX — almost all native Mac apps, most Cocoa third-party
 //       apps, and Electron apps that respect AXManualAccessibility).
 //    2. Browser DOM coordinates through CUA/CDP for Chromium web pages.
-//    3. Native detector cache refinement for apps with weak AX trees.
-//    4. Raw Gemini-emitted box_2d coordinates as the absolute fallback.
+//    3. Local perception cache from the on-device overlay, which can
+//       resolve visible labels without Gemini screenshot streaming.
+//    4. Native detector cache refinement for apps with weak AX trees.
+//    5. Raw Gemini-emitted box_2d coordinates as the absolute fallback.
 //       These come from the same model that named the element, so they
 //       reflect Gemini's spatial intent for that exact tool call.
 //
@@ -36,6 +38,7 @@ final class ElementResolver: @unchecked Sendable {
         case accessibilityTree       // AX tree gave us exact frame
         case browserDOMCoordinates   // Browser DOM rect through CUA/CDP
         case nativeDetectorCache     // Local CoreML/Vision detector refined the model hint
+        case localPerceptionCache    // Local overlay detector resolved without Gemini screenshot coords
         case llmRawCoordinates       // Straight from Gemini's box_2d, no refinement
     }
 
@@ -153,7 +156,8 @@ final class ElementResolver: @unchecked Sendable {
         llmHintInScreenshotPixels: CGPoint?,
         latestCapture: CompanionScreenCapture?,
         targetAppHint: String? = nil,
-        proximityAnchorInGlobalScreen: CGPoint? = nil
+        proximityAnchorInGlobalScreen: CGPoint? = nil,
+        preferLocalHintBeforeAccessibility: Bool = false
     ) async -> Resolution? {
 
         // Staleness check on the screenshot — resolving against a frame
@@ -170,6 +174,15 @@ final class ElementResolver: @unchecked Sendable {
         let shouldSkipAXAndBrowser = shouldSkipAXAndBrowserForVisionOnlyApp(targetAppHint: targetAppHint)
         if shouldSkipAXAndBrowser {
             print("[ElementResolver] ⏭ vision-only app \"\(targetAppHint ?? "?")\" — skipping AX/CDP for \"\(label)\"")
+        }
+
+        if preferLocalHintBeforeAccessibility,
+           let localPerceptionResolution = localPerceptionResolution(
+               label: label,
+               llmHintInScreenshotPixels: llmHintInScreenshotPixels,
+               proximityAnchorInGlobalScreen: proximityAnchorInGlobalScreen
+           ) {
+            return localPerceptionResolution
         }
 
         // 1. AX tree first — fastest and most reliable for native apps.
@@ -233,12 +246,24 @@ final class ElementResolver: @unchecked Sendable {
             }
         }
 
+        // 3. Local perception cache from the on-device YOLO/OCR overlay.
+        //    This path does not require Gemini screenshot streaming or
+        //    a box_2d hint. It lets commands like "click Add" resolve
+        //    entirely from local UI labels in canvas-heavy apps.
+        if let localPerceptionResolution = localPerceptionResolution(
+            label: label,
+            llmHintInScreenshotPixels: llmHintInScreenshotPixels,
+            proximityAnchorInGlobalScreen: proximityAnchorInGlobalScreen
+        ) {
+            return localPerceptionResolution
+        }
+
         guard let capture = latestCapture else {
-            print("[ElementResolver] ✗ no AX match and no screenshot capture — giving up on \"\(label)\"")
+            print("[ElementResolver] ✗ no AX/local match and no screenshot capture — giving up on \"\(label)\"")
             return nil
         }
 
-        // 3. If the native detector overlay/cache is warm, use it to
+        // 4. If the native detector overlay/cache is warm, use it to
         //    refine the model's rough point before falling back raw.
         //    This matters for apps like Blender where AX exposes almost
         //    nothing, but the local detector can still see tabs/buttons.
@@ -250,7 +275,7 @@ final class ElementResolver: @unchecked Sendable {
             return nativeDetectorResolution
         }
 
-        // 4. Trust the model's box_2d when it gave us one. This is
+        // 5. Trust the model's box_2d when it gave us one. This is
         //    Gemini's spatial output for the same query that emitted
         //    the label — one model, one decision.
         if let hint = llmHintInScreenshotPixels {
@@ -263,6 +288,30 @@ final class ElementResolver: @unchecked Sendable {
 
         print("[ElementResolver] ✗ could not resolve \"\(label)\" — AX missed and no box_2d hint")
         return nil
+    }
+
+    private func localPerceptionResolution(
+        label: String,
+        llmHintInScreenshotPixels: CGPoint?,
+        proximityAnchorInGlobalScreen: CGPoint?
+    ) -> Resolution? {
+        let cursorAnchor = proximityAnchorInGlobalScreen ?? NSEvent.mouseLocation
+        guard let target = LocalPerceptionTargetCache.shared.resolve(
+            label: label,
+            preferMatchesNearGlobalPoint: cursorAnchor,
+            pointHintInScreenshotPixels: llmHintInScreenshotPixels
+        ) else {
+            return nil
+        }
+
+        print("[ElementResolver] ✓ local perception resolved \"\(label)\" → \"\(target.label)\" [\(target.source)] at \(target.globalScreenPoint), cacheAge=\(target.cacheAgeMs)ms")
+        return Resolution(
+            globalScreenPoint: target.globalScreenPoint,
+            displayFrame: target.displayFrame,
+            label: target.label,
+            source: .localPerceptionCache,
+            globalScreenRect: target.globalScreenRect
+        )
     }
 
     private func nativeDetectorResolution(

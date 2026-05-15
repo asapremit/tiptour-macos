@@ -62,6 +62,7 @@ final class ActionExecutor {
             useFrontmostHIDPath: true
         )
         print("[ActionExecutor] CUA clicked pid=\(targetProcessIdentifier) at \(cuaScreenPoint)")
+        NotificationCenter.default.post(name: .tipTourUserInterfaceClickExecuted, object: nil)
     }
 
     func rightClick(
@@ -305,6 +306,7 @@ final class ActionExecutor {
             useFrontmostHIDPath: true
         )
         print("[ActionExecutor] CUA \(button.rawValue)-clicked pid=\(targetProcessIdentifier) at \(cuaScreenPoint)")
+        NotificationCenter.default.post(name: .tipTourUserInterfaceClickExecuted, object: nil)
     }
 
     // MARK: - Target App

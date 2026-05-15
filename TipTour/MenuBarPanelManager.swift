@@ -21,6 +21,7 @@ extension Notification.Name {
     /// click-outside monitor based on the new pinned state, without
     /// hiding the panel.
     static let tipTourPanelPinStateChanged = Notification.Name("tipTourPanelPinStateChanged")
+    static let tipTourUserInterfaceClickExecuted = Notification.Name("tipTourUserInterfaceClickExecuted")
 }
 
 /// Custom NSPanel subclass that can become the key window even with

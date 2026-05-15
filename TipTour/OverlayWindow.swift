@@ -198,6 +198,7 @@ struct BlueCursorView: View {
     @ObservedObject var companionManager: CompanionManager
 
     @State private var cursorPosition: CGPoint
+    @State private var rawCursorPosition: CGPoint
     @State private var isCursorOnThisScreen: Bool
 
     /// Horizontal offset from `cursorPosition` to the LEFT edge of
@@ -225,6 +226,8 @@ struct BlueCursorView: View {
         let mouseLocation = NSEvent.mouseLocation
         let localX = mouseLocation.x - screenFrame.origin.x
         let localY = screenFrame.height - (mouseLocation.y - screenFrame.origin.y)
+        let rawInitialPosition = CGPoint(x: localX, y: localY)
+        _rawCursorPosition = State(initialValue: rawInitialPosition)
         _cursorPosition = State(initialValue: CGPoint(x: localX + 35, y: localY + 25))
         _isCursorOnThisScreen = State(initialValue: screenFrame.contains(mouseLocation))
     }
@@ -325,7 +328,8 @@ struct BlueCursorView: View {
                     elements: companionManager.detectionOverlayElements,
                     highlightedLabel: companionManager.detectionOverlayHighlightedLabel,
                     screenFrame: screenFrame,
-                    imageSize: companionManager.detectionOverlayImageSize
+                    imageSize: companionManager.detectionOverlayImageSize,
+                    cursorPoint: isCursorOnThisScreen ? rawCursorPosition : nil
                 )
             }
 
@@ -563,6 +567,7 @@ struct BlueCursorView: View {
             isCursorOnThisScreen = screenFrame.contains(mouseLocation)
 
             let swiftUIPosition = convertScreenPointToSwiftUICoordinates(mouseLocation)
+            self.rawCursorPosition = swiftUIPosition
             self.cursorPosition = CGPoint(x: swiftUIPosition.x + 35, y: swiftUIPosition.y + 25)
 
             startTrackingCursor()
@@ -653,6 +658,7 @@ struct BlueCursorView: View {
 
             // Normal cursor following
             let swiftUIPosition = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
+            self.rawCursorPosition = swiftUIPosition
             let buddyX = swiftUIPosition.x + 35
             let buddyY = swiftUIPosition.y + 25
             let nextCursorPosition = CGPoint(x: buddyX, y: buddyY)

@@ -612,13 +612,16 @@ final class WorkflowRunner: ObservableObject {
             if Task.isCancelled { return }
             if operationToken != currentOperationToken { return }
             attemptIndex += 1
+            let activeStepHasSpatialHint = activeStep?.hintCoordinate != nil
+                || activeStep?.box2DNormalized != nil
 
             // Pass 1: poll AX with a short budget. This is the fast path
             // for native apps and Electron — usually resolves in <100ms.
             // Canvas/no-AX apps like Blender skip this entirely so we
             // don't waste time repeatedly querying an empty tree before
             // using Gemini's box_2d.
-            if !shouldSkipAccessibilityResolution(for: activePlan?.app) {
+            if !activeStepHasSpatialHint,
+               !shouldSkipAccessibilityResolution(for: activePlan?.app) {
                 if let axResolution = await ElementResolver.shared.pollAccessibilityTree(
                     label: label,
                     targetAppHint: activePlan?.app,
@@ -648,7 +651,8 @@ final class WorkflowRunner: ObservableObject {
                    llmHintInScreenshotPixels: activeStep?.hintCoordinate(in: capture),
                    latestCapture: capture,
                    targetAppHint: activePlan?.app,
-                   proximityAnchorInGlobalScreen: previousStepResolvedGlobalScreenPoint
+                   proximityAnchorInGlobalScreen: previousStepResolvedGlobalScreenPoint,
+                   preferLocalHintBeforeAccessibility: activeStepHasSpatialHint
                ) {
                 if Task.isCancelled { return }
                 if operationToken != currentOperationToken { return }

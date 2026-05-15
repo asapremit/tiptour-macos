@@ -128,6 +128,11 @@ final class GeminiLiveSession: ObservableObject {
     /// and "current screen".
     @Published private(set) var latestCapture: CompanionScreenCapture?
 
+    /// Privacy toggle: when false, this session does not capture or send
+    /// screen JPEGs to Gemini. Voice and tool calls still work, but the
+    /// model must rely on spoken instructions and local tool results.
+    @Published private(set) var isScreenshotStreamingEnabled: Bool = true
+
     /// Last perceptual hash sent to Gemini, keyed by the screen label
     /// from CompanionScreenCapture (stable per display across ticks).
     /// If a fresh capture is within the dHash threshold we skip the
@@ -203,6 +208,12 @@ final class GeminiLiveSession: ObservableObject {
             )
         }
 
+        if !isScreenshotStreamingEnabled {
+            geminiClient.sendText("""
+            Privacy mode is active: screenshot streaming is disabled for this session. You cannot see the user's screen unless the user explicitly provides visual context in text. Use voice instructions, app names, accessibility labels, workflow tools, and local action execution. Do not claim that you can see the screen.
+            """)
+        }
+
         // Fresh session = fresh visual context. Drop any cached hashes
         // from a previous session so the very first frame is always sent
         // (otherwise restarting TipTour on the same unchanged screen would
@@ -226,8 +237,10 @@ final class GeminiLiveSession: ObservableObject {
         // speaking as soon as Gemini setup completes. This avoids making
         // the hotkey feel blocked on ScreenCaptureKit/JPEG work.
         _ = initialScreenshot
-        Task { @MainActor in
-            await captureAndProcessFrameForGemini()
+        if isScreenshotStreamingEnabled {
+            Task { @MainActor in
+                await captureAndProcessFrameForGemini()
+            }
         }
 
         print("[GeminiLiveSession] Session started")
@@ -435,6 +448,29 @@ final class GeminiLiveSession: ObservableObject {
         screenshotUpdateTimer = nil
     }
 
+    func setScreenshotStreamingEnabled(_ enabled: Bool) {
+        isScreenshotStreamingEnabled = enabled
+
+        if enabled {
+            print("[GeminiLiveSession] Screenshot streaming enabled")
+            invalidateScreenshotHashCache()
+            if isActive {
+                Task { @MainActor in
+                    await captureAndProcessFrameForGemini()
+                }
+            }
+        } else {
+            print("[GeminiLiveSession] Screenshot streaming disabled")
+            latestCapture = nil
+            lastSentScreenshotHashByScreenLabel.removeAll()
+            if isActive {
+                geminiClient.sendText("""
+                Privacy mode is now active: screenshot streaming has been disabled. Stop using visual assumptions from previous frames. Continue from voice instructions, local accessibility labels, and tool results only.
+                """)
+            }
+        }
+    }
+
     /// Capture one frame and send it to Gemini for visual context.
     /// YOLO detection is NOT run here — it only runs on-demand when the
     /// AX tree lookup fails. Keeping this method lightweight is critical
@@ -455,6 +491,10 @@ final class GeminiLiveSession: ObservableObject {
     /// returns nil and we just send the screenshot; Gemini falls back
     /// to its vision-only behavior for those.
     private func captureAndProcessFrameForGemini() async {
+        guard isScreenshotStreamingEnabled else {
+            return
+        }
+
         guard let screenshots = try? await CompanionScreenCaptureUtility.captureAllScreensAsJPEG(),
               let primaryCapture = screenshots.first else {
             return
@@ -552,7 +592,7 @@ final class GeminiLiveSession: ObservableObject {
     /// Send a fresh screenshot during the session — useful when the user
     /// mentions a new UI element and we want Gemini to see the current state.
     func sendScreenshot(_ jpegData: Data) {
-        guard isActive else { return }
+        guard isActive, isScreenshotStreamingEnabled else { return }
         geminiClient.sendScreenshot(jpegData)
     }
 
@@ -740,7 +780,11 @@ final class GeminiLiveSession: ObservableObject {
             // Gemini should be able to see the screen again.
             if areScreenshotsSuppressedUntilUserSpeaks {
                 areScreenshotsSuppressedUntilUserSpeaks = false
-                print("[GeminiLiveSession] 🔊 user spoke — screenshots resumed")
+                if isScreenshotStreamingEnabled {
+                    print("[GeminiLiveSession] 🔊 user spoke — screenshots resumed")
+                } else {
+                    print("[GeminiLiveSession] 🔊 user spoke — screenshot streaming remains disabled")
+                }
             }
 
         case .outputTranscript:

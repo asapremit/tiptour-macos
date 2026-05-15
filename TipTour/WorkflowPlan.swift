@@ -136,8 +136,12 @@ struct WorkflowStep: Codable, Identifiable, Hashable {
     }
 
     func hintCoordinate(in capture: CompanionScreenCapture?) -> CGPoint? {
-        guard let box = box2DNormalized, box.count == 4, let capture else {
+        if let hintCoordinate {
             return hintCoordinate
+        }
+
+        guard let box = box2DNormalized, box.count == 4, let capture else {
+            return nil
         }
 
         let y1Norm = CGFloat(box[0])
